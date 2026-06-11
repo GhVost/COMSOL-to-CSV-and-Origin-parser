@@ -23,6 +23,8 @@ import argparse
 import sys
 import re
 import json
+import shutil
+import tempfile
 from pathlib import Path
 from datetime import datetime
 
@@ -136,23 +138,39 @@ def extract_table(model, tag: str) -> pd.DataFrame | None:
 # a text file with '%'-commented headers followed by numeric columns.
 
 def export_via_comsol(model, pg_tag: str, output_dir: Path) -> Path | None:
-    """Use COMSOL's native 'Plot' export to dump a plot group to a text file."""
-    try:
-        fname = sanitize_filename(pg_tag) + '_export.txt'
-        export_path = output_dir / fname
+    """Use COMSOL's native 'Plot' export to dump a plot group to a text file.
 
-        export_tag = f'exp_{pg_tag}'
-        exp = model.java.result().export().create(export_tag, 'Plot')
-        exp.set('plotgroup', pg_tag)
-        exp.set('filename', str(export_path))
-        exp.run()
-        model.java.result().export().remove(export_tag)
+    COMSOL can sometimes refuse to write directly into the model's output
+    folder (locking, permissions, ...), so fall back to the system temp
+    directory and move the result into place if needed.
+    """
+    fname = sanitize_filename(pg_tag) + '_export.txt'
+    export_tag = f'exp_{pg_tag}'
+
+    for target_dir in (output_dir, Path(tempfile.gettempdir())):
+        export_path = target_dir / fname
+        try:
+            exp = model.java.result().export().create(export_tag, 'Plot')
+            exp.set('plotgroup', pg_tag)
+            exp.set('filename', str(export_path))
+            exp.run()
+        except Exception as e:
+            print(f"  [!] COMSOL export to '{target_dir}' failed for '{pg_tag}': {e}")
+            continue
+        finally:
+            try:
+                model.java.result().export().remove(export_tag)
+            except Exception:
+                pass
 
         if export_path.exists():
+            if target_dir != output_dir:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                final_path = output_dir / fname
+                shutil.move(str(export_path), str(final_path))
+                return final_path
             return export_path
 
-    except Exception as e:
-        print(f"  [!] COMSOL export failed for '{pg_tag}': {e}")
     return None
 
 
@@ -322,6 +340,7 @@ def main():
     java_result = model.java.result()
 
     # ---- Tables ----
+    output_dir.mkdir(parents=True, exist_ok=True)
     try:
         tbl_tags_obj = java_result.table().tags()
         tbl_tags = [str(t) for t in tbl_tags_obj]
@@ -349,6 +368,7 @@ def main():
             print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
 
     # ---- Plot groups ----
+    output_dir.mkdir(parents=True, exist_ok=True)
     try:
         pg_tags_obj = java_result.tags()
         pg_tags = [str(t) for t in pg_tags_obj]
@@ -390,6 +410,7 @@ def main():
             print(f"    [!] No data extracted for '{tag}'")
 
     # -- Write manifest --
+    output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / 'manifest.json'
     with open(manifest_path, 'w') as f:
         json.dump(manifest, f, indent=2)
