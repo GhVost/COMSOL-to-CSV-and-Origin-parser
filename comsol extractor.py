@@ -75,24 +75,32 @@ def discover_nodes(model, root: str) -> list[str]:
 
 
 def get_plot_type(java_plot) -> str:
-    """Heuristic to classify a result feature as table / 1d / 2d / other."""
-    type_str = str(type(java_plot)).lower()
-    class_name = java_plot.getClass().getSimpleName() if hasattr(java_plot, 'getClass') else ''
-    class_lower = class_name.lower()
+    """Classify a result feature as table / 1d / 2d / 3d / other.
 
-    if 'table' in class_lower or 'table' in type_str:
+    MPh wraps every result node in a generic 'ResultFeatureClient' proxy, so
+    the Java class name is useless for classification. Instead, ask COMSOL
+    for the feature's type string (e.g. 'PlotGroup1D', 'PlotGroup3D').
+    """
+    try:
+        ftype = str(java_plot.getType()).lower() if hasattr(java_plot, 'getType') else ''
+    except Exception:
+        ftype = ''
+
+    if 'table' in ftype:
         return 'table'
-    if 'plot1d' in class_lower or 'pg1d' in type_str or '1d' in class_lower:
+    if 'plotgroup1d' in ftype:
         return '1d'
-    if 'plot2d' in class_lower or 'pg2d' in type_str or '2d' in class_lower:
+    if 'plotgroup2d' in ftype:
         return '2d'
-    if 'plotgroup' in class_lower:
-        # Inspect dimension hint from node properties
-        try:
-            dim = int(java_plot.getInt('plotdim'))
-            return f'{dim}d'
-        except Exception:
-            pass
+    if 'plotgroup3d' in ftype:
+        return '3d'
+
+    # Fallback: inspect the 'plotdim' property of plot-group features.
+    try:
+        dim = int(java_plot.getInt('plotdim'))
+        return f'{dim}d'
+    except Exception:
+        pass
     return 'unknown'
 
 
@@ -278,15 +286,46 @@ def export_via_comsol(model, pg_tag: str, output_dir: Path) -> Path | None:
     return None
 
 
+def extract_via_export(model, pg_tag: str, output_dir: Path) -> pd.DataFrame | None:
+    """
+    Extract a plot group's data via COMSOL's native text export.
+    Used for 3D plot groups (and anything else getData() can't handle),
+    where field values are exported as plain x/y/z/value columns.
+    """
+    export_path = export_via_comsol(model, pg_tag, output_dir)
+    if export_path is None:
+        return None
+
+    try:
+        df = pd.read_csv(export_path, comment='%', sep=r'\s+', header=None)
+    except Exception as e:
+        print(f"  [!] Could not parse export for '{pg_tag}': {e}")
+        return None
+
+    if df.empty:
+        return None
+
+    ncols = len(df.columns)
+    if ncols == 2:
+        df.columns = ['x', 'y']
+    elif ncols == 3:
+        df.columns = ['x', 'y', 'z']
+    elif ncols == 4:
+        df.columns = ['x', 'y', 'z', 'value']
+    else:
+        df.columns = [f'col{i}' for i in range(ncols)]
+    return df
+
+
 # ---------------------------------------------------------------------------
 # OriginLab integration (optional)
 # ---------------------------------------------------------------------------
 
-def push_to_origin(csv_dir: Path, template: str = ''):
+def push_to_origin(datasets: list, output_dir: Path, template: str = ''):
     """
-    Import all extracted CSVs into OriginLab.
+    Build an OriginLab project directly from extracted DataFrames.
     Requires: pip install originpro
-    Must be run with Origin running or from Origin's embedded Python.
+    Must be run with Origin installed (originpro drives it via COM).
     """
     try:
         import originpro as op
@@ -295,39 +334,36 @@ def push_to_origin(csv_dir: Path, template: str = ''):
         print("    Then run this from Origin's Script Window or with Origin running.")
         return
 
-    csv_files = sorted(csv_dir.glob('*.csv'))
-    if not csv_files:
-        print("No CSV files found to import.")
+    if not datasets:
+        print("No data to import into Origin.")
         return
 
-    for csv_path in csv_files:
-        df = pd.read_csv(csv_path)
-        wb = op.new_book('w', csv_path.stem)
+    for entry in datasets:
+        name, kind, df = entry['name'], entry['kind'], entry['df']
+
+        # Multiple curves sharing one x-axis come back as long-format (x, y, group);
+        # pivot to wide format (one y column per group) for proper multi-curve plotting.
+        if 'group' in df.columns and {'x', 'y'}.issubset(df.columns):
+            df = df.pivot_table(index='x', columns='group', values='y', sort=False).reset_index()
+            df.columns = ['x'] + [str(c) for c in df.columns[1:]]
+
+        wb = op.new_book('w', name)
         sheet = wb[0]
+        sheet.from_df(df)
+        if len(df.columns) >= 2:
+            sheet.cols_axis('xy', repeat=True)
 
-        for i, col in enumerate(df.columns):
-            sheet.from_list(i, df[col].tolist(), col)
+        if kind in ('table', '1d') and len(df.columns) >= 2:
+            graph = op.new_graph(template=template) if template else op.new_graph()
+            layer = graph[0]
+            for i in range(1, len(df.columns)):
+                layer.add_plot(sheet, coly=i, colx=0)
+            layer.rescale()
+            graph.lname = name
 
-        # Set column designations
-        if len(df.columns) >= 1:
-            sheet.set_label(0, 'X')
-        for i in range(1, len(df.columns)):
-            sheet.set_label(i, 'Y')
+        print(f"  -> Imported: {name}")
 
-        # Create a graph
-        if template:
-            graph = op.new_graph(template=template)
-        else:
-            graph = op.new_graph()
-
-        layer = graph[0]
-        for i in range(1, len(df.columns)):
-            layer.add_plot(sheet, coly=i, colx=0)
-        layer.rescale()
-        graph.set_str('LongName', csv_path.stem)
-        print(f"  -> Imported: {csv_path.stem}")
-
-    opju_path = csv_dir / 'comsol_results.opju'
+    opju_path = output_dir / 'comsol_results.opju'
     op.save(str(opju_path))
     print(f"\nOrigin project saved: {opju_path}")
 
@@ -413,8 +449,10 @@ def main():
         'tables': [],
         '1d_plots': [],
         '2d_plots': [],
+        '3d_plots': [],
         'other': [],
     }
+    datasets = []  # collected for direct OriginLab export: {'name', 'kind', 'df'}
 
     # -- Discover result nodes --
     java_result = model.java.result()
@@ -423,7 +461,8 @@ def main():
     try:
         tbl_tags_obj = java_result.table().tags()
         tbl_tags = [str(t) for t in tbl_tags_obj]
-    except Exception:
+    except Exception as e:
+        print(f"  [!] Could not list result tables: {e}")
         tbl_tags = []
 
     if tbl_tags:
@@ -437,25 +476,29 @@ def main():
 
         df = extract_table(model, tag)
         if df is not None and not df.empty:
-            fname = sanitize_filename(f"table_{tag}_{label}") + '.csv'
+            name = sanitize_filename(f"table_{tag}_{label}")
+            fname = name + '.csv'
             df.to_csv(output_dir / fname, index=False)
             manifest['tables'].append({'tag': tag, 'label': label, 'file': fname,
                                        'rows': len(df), 'cols': list(df.columns)})
+            datasets.append({'name': name, 'kind': 'table', 'df': df})
             print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
 
     # ---- Plot groups ----
     try:
         pg_tags_obj = java_result.tags()
         pg_tags = [str(t) for t in pg_tags_obj]
-    except Exception:
+    except Exception as e:
+        print(f"  [!] Could not list plot groups: {e}")
         pg_tags = []
 
     for tag in pg_tags:
         try:
-            pg = java_result(tag)
+            pg = model.java.result(tag)
             label = str(pg.label()) if hasattr(pg, 'label') else tag
-            class_name = pg.getClass().getSimpleName()
-        except Exception:
+            class_name = str(pg.getClass().getSimpleName())
+        except Exception as e:
+            print(f"  [!] Could not access plot group '{tag}': {e}")
             continue
 
         ptype = get_plot_type(pg)
@@ -464,12 +507,14 @@ def main():
         if ptype == '1d':
             data = extract_1d_plot(model, tag)
             for child_tag, df in data.items():
-                fname = sanitize_filename(f"plot1d_{tag}_{child_tag}") + '.csv'
+                name = sanitize_filename(f"plot1d_{tag}_{child_tag}")
+                fname = name + '.csv'
                 df.to_csv(output_dir / fname, index=False)
                 manifest['1d_plots'].append({
                     'tag': tag, 'child': child_tag, 'label': label,
                     'file': fname, 'rows': len(df), 'cols': list(df.columns)
                 })
+                datasets.append({'name': name, 'kind': '1d', 'df': df})
                 print(f"    -> Saved {fname}  ({len(df)} rows)")
 
             # Fallback if nothing extracted
@@ -481,18 +526,35 @@ def main():
         elif ptype == '2d':
             data = extract_2d_plot(model, tag, output_dir)
             for child_tag, df in data.items():
-                fname = sanitize_filename(f"plot2d_{tag}_{child_tag}") + '.csv'
+                name = sanitize_filename(f"plot2d_{tag}_{child_tag}")
+                fname = name + '.csv'
                 df.to_csv(output_dir / fname, index=False)
                 manifest['2d_plots'].append({
                     'tag': tag, 'child': child_tag, 'label': label,
                     'file': fname, 'rows': len(df), 'cols': list(df.columns)
                 })
+                datasets.append({'name': name, 'kind': '2d', 'df': df})
                 print(f"    -> Saved {fname}  ({len(df)} rows)")
 
             if not data and args.fallback_export:
                 p = export_via_comsol(model, tag, output_dir)
                 if p:
                     print(f"    -> Fallback export: {p.name}")
+
+        elif ptype == '3d':
+            df = extract_via_export(model, tag, output_dir)
+            if df is not None and not df.empty:
+                name = sanitize_filename(f"plot3d_{tag}")
+                fname = name + '.csv'
+                df.to_csv(output_dir / fname, index=False)
+                manifest['3d_plots'].append({
+                    'tag': tag, 'label': label,
+                    'file': fname, 'rows': len(df), 'cols': list(df.columns)
+                })
+                datasets.append({'name': name, 'kind': '3d', 'df': df})
+                print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)  [via COMSOL export]")
+            else:
+                print(f"    [!] No data extracted for '{tag}'")
 
         else:
             manifest['other'].append({'tag': tag, 'label': label, 'type': class_name})
@@ -511,12 +573,14 @@ def main():
     n_tables = len(manifest['tables'])
     n_1d = len(manifest['1d_plots'])
     n_2d = len(manifest['2d_plots'])
+    n_3d = len(manifest['3d_plots'])
     n_other = len(manifest['other'])
     print(f"\n{'='*50}")
     print(f"Extraction complete!")
     print(f"  Tables:    {n_tables}")
     print(f"  1D plots:  {n_1d}")
     print(f"  2D plots:  {n_2d}")
+    print(f"  3D plots:  {n_3d}")
     print(f"  Other:     {n_other}")
     print(f"  Output:    {output_dir}")
     print(f"{'='*50}")
@@ -524,7 +588,7 @@ def main():
     # -- Optional: push to OriginLab --
     if args.origin:
         print("\nPushing results to OriginLab...")
-        push_to_origin(output_dir, template=args.origin_template)
+        push_to_origin(datasets, output_dir, template=args.origin_template)
 
     # -- Clean up --
     client.clear()
