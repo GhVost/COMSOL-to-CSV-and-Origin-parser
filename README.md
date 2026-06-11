@@ -21,27 +21,29 @@ python -m venv .venv
 ## Usage
 
 ```powershell
-# Open a file picker dialog to choose the .mph file
-.venv\Scripts\python.exe ComsolExtractor.py
-
-# Extract a specific model
-.venv\Scripts\python.exe ComsolExtractor.py model.mph
-
-# Choose a custom output directory
-.venv\Scripts\python.exe ComsolExtractor.py model.mph --output ./out
-
-# Also build an OriginLab project (.opju) from the extracted data
-.venv\Scripts\python.exe ComsolExtractor.py model.mph --origin --origin-template my_template.otpu
+.venv\Scripts\python.exe ComsolExtractor.py --origin
 ```
+
+This opens a file picker to choose the `.mph` model, extracts everything,
+and builds an OriginLab project (`.opju`).
+
+Other options:
+
+- `ComsolExtractor.py model.mph` — extract a specific model (skips the file
+  dialog), without `--origin` if only CSVs are needed
+- `--output ./out` — custom output directory
+- `--origin-template my_template.otpu` — Origin graph template for line plots
 
 ## Output
 
 Results are written to `<model_name>_results/` next to the `.mph` file:
 
 - One CSV per result table and per plot group (1D/2D/3D), named after the
-  COMSOL tag and label
+  COMSOL tag and label. Column headers include COMSOL's units (e.g.
+  `Total displacement (m)`), and any model/description metadata or
+  user-entered "Comments" are written as leading `%` comment lines.
 - `manifest.json` — summary of everything extracted (tags, labels, files,
-  row/column counts)
+  row/column counts, and the same comments)
 - `comsol_results.opju` (only with `--origin`) — an OriginLab project with
   one worksheet per dataset; tables and 1D plots additionally get a line
   graph
@@ -49,16 +51,24 @@ Results are written to `<model_name>_results/` next to the `.mph` file:
 ## How it works
 
 - `MPh` starts a COMSOL session and loads the model.
-- Result tables are read directly via COMSOL's table API.
+- Result tables are read directly via COMSOL's table API, which already
+  includes column headers with units.
 - Plot group data (1D/2D/3D) is pulled using COMSOL's built-in "Plot" data
   export, which is more reliable across COMSOL versions than the
-  feature-level data API.
+  feature-level data API. The exported `%`-commented header line is parsed
+  to recover per-column names and units.
 - If `--origin` is given, the in-memory data is pushed straight into Origin
-  via `originpro` (COM automation) — no CSV round-trip needed.
+  via `originpro` (COM automation) — no CSV round-trip needed. Column long
+  names/units and the comments are applied to each worksheet.
 
 ## Notes
 
-- If a COMSOL process is already running, the script warns that starting its
-  own session will use an additional engine instance and license seat.
-- `--origin` requires OriginLab to be installed and running on the same
-  machine.
+- Before starting, the script checks whether COMSOL or (with `--origin`)
+  OriginLab are already running and prints a prompt if action may be needed:
+  - If a COMSOL process is already running, starting this script's own
+    session will use an additional engine instance and license seat —
+    close the existing session first if you want to avoid that.
+  - With `--origin`, if OriginLab isn't running yet, start it so `originpro`
+    can connect to it.
+  - Each prompt waits for Enter to continue, or Ctrl+C to abort.
+- `--origin` requires OriginLab to be installed on the same machine.

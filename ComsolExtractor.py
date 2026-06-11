@@ -4,6 +4,13 @@ COMSOL .mph Result Extractor
 Extracts all result tables and plot groups (1D/2D/3D) from a COMSOL model
 and saves them as CSV files ready for OriginLab import.
 
+Each CSV keeps COMSOL's column headers, including units (e.g.
+'Total displacement (m)'), and any model/description metadata or user
+"Comments" are written as leading '%' comment lines and recorded in
+manifest.json. With --origin, those headers/units are also applied to the
+Origin worksheet's long name / units row, and the comments to the sheet's
+comments.
+
 Requirements:
     - COMSOL Multiphysics installed (any version 5.x / 6.x)
     - Python 3.8+
@@ -11,10 +18,11 @@ Requirements:
     - pip install originpro and OriginLab installed (only for --origin)
 
 Usage:
-    python ComsolExtractor.py                          # opens file dialog
-    python ComsolExtractor.py model.mph                # CLI path
-    python ComsolExtractor.py model.mph --output ./out # custom output dir
-    python ComsolExtractor.py model.mph --origin       # also build .opju in OriginLab
+    python ComsolExtractor.py --origin
+
+Opens a file dialog to pick the .mph model, then extracts everything and
+builds an OriginLab project. A model path, --output <dir> and
+--origin-template <file> can also be given; see --help for details.
 
 Output is saved to a folder named <model_name>_results/ next to the .mph file.
 """
@@ -57,6 +65,22 @@ def sanitize_filename(name: str) -> str:
     return name.strip('_')[:120]
 
 
+def split_label_unit(label: str) -> tuple[str, str]:
+    """Split a 'Name (unit)' column header into ('Name', 'unit')."""
+    m = re.match(r'^(.*?)\s*\(([^()]*)\)\s*$', str(label).strip())
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return str(label).strip(), ''
+
+
+def write_csv_with_comments(df: pd.DataFrame, path: Path, comments: list[str] | None = None):
+    """Write a DataFrame to CSV with COMSOL metadata as leading '%' comment lines."""
+    with open(path, 'w', encoding='utf-8') as f:
+        for line in comments or []:
+            f.write(f"% {line}\n")
+        df.to_csv(f, index=False)
+
+
 def comsol_already_running() -> bool:
     """Check whether a COMSOL Desktop/server process is already running."""
     if psutil is None:
@@ -66,6 +90,26 @@ def comsol_already_running() -> bool:
         if name.startswith('comsol'):
             return True
     return False
+
+
+def origin_already_running() -> bool:
+    """Check whether OriginLab (Origin/OriginPro) is already running."""
+    if psutil is None:
+        return False
+    for proc in psutil.process_iter(['name']):
+        name = (proc.info.get('name') or '').lower()
+        if name.startswith('origin'):
+            return True
+    return False
+
+
+def confirm_or_exit(message: str):
+    """Print a message and wait for the user to press Enter (or Ctrl+C to abort)."""
+    print(message)
+    try:
+        input("Press Enter to continue, or Ctrl+C to abort... ")
+    except KeyboardInterrupt:
+        sys.exit("\nAborted by user.")
 
 
 def get_plot_type(java_plot) -> str:
@@ -102,14 +146,16 @@ def get_plot_type(java_plot) -> str:
 # Extraction routines
 # ---------------------------------------------------------------------------
 
-def extract_table(model, tag: str) -> pd.DataFrame | None:
+def extract_table(model, tag: str) -> tuple[pd.DataFrame, list[str]] | None:
     """
-    Extract a COMSOL result table into a DataFrame.
-    Tables are stored under model.result().table(tag).
+    Extract a COMSOL result table into a DataFrame, plus any user comments.
+
+    Tables are stored under model.result().table(tag). Column headers
+    returned by COMSOL already include units, e.g. 'freq (GHz)'.
     """
     try:
         tbl = model.java.result().table(tag)
-        # Get column headers
+        # Get column headers (units, e.g. "freq (GHz)", are included by COMSOL)
         ncols = tbl.getTableData().getNumColumns()
         headers = [str(tbl.getTableData().getColumnHeader(i)) for i in range(ncols)]
         # Get data row by row
@@ -120,7 +166,16 @@ def extract_table(model, tag: str) -> pd.DataFrame | None:
                 data[r, c] = tbl.getTableData().getDoubleValue(r, c)
 
         df = pd.DataFrame(data, columns=headers)
-        return df
+
+        comments = []
+        try:
+            note = str(tbl.comments())
+            if note:
+                comments.append(note)
+        except Exception:
+            pass
+
+        return df, comments
 
     except Exception as e:
         print(f"  [!] Could not extract table '{tag}': {e}")
@@ -174,31 +229,60 @@ def export_via_comsol(model, pg_tag: str, output_dir: Path) -> Path | None:
     return None
 
 
-def extract_via_export(model, pg_tag: str, output_dir: Path) -> pd.DataFrame | None:
+def parse_comsol_export(path: Path) -> tuple[pd.DataFrame, list[str]] | None:
+    """Parse a COMSOL text export into (DataFrame, metadata comment lines).
+
+    COMSOL prefixes the file with '%' lines holding metadata (Model, Version,
+    Date, Description, ...). The last '%' line normally holds the column
+    headers, with each header (e.g. 'Total displacement (m)') separated from
+    the next by a run of 2+ spaces, while the unit's parentheses use single
+    spaces - so splitting on '\\s{2,}' recovers the per-column labels.
+    """
+    text = path.read_text(encoding='utf-8', errors='replace')
+    comment_lines = [line[1:].strip() for line in text.splitlines() if line.startswith('%')]
+
+    try:
+        df = pd.read_csv(path, comment='%', sep=r'\s+', header=None)
+    except Exception:
+        return None
+    if df.empty:
+        return None
+
+    headers = None
+    meta = comment_lines
+    if comment_lines:
+        candidate = re.split(r'\s{2,}', comment_lines[-1].strip())
+        if len(candidate) == len(df.columns):
+            headers = candidate
+            meta = comment_lines[:-1]
+
+    if headers:
+        df.columns = headers
+    else:
+        ncols = len(df.columns)
+        if ncols == 2:
+            df.columns = ['x', 'y']
+        elif ncols == 3:
+            df.columns = ['x', 'y', 'z']
+        elif ncols == 4:
+            df.columns = ['x', 'y', 'z', 'value']
+        else:
+            df.columns = [f'col{i}' for i in range(ncols)]
+
+    return df, meta
+
+
+def extract_via_export(model, pg_tag: str, output_dir: Path) -> tuple[pd.DataFrame, list[str]] | None:
     """Extract a plot group's data via COMSOL's native text export into a DataFrame."""
     export_path = export_via_comsol(model, pg_tag, output_dir)
     if export_path is None:
         return None
 
     try:
-        df = pd.read_csv(export_path, comment='%', sep=r'\s+', header=None)
+        return parse_comsol_export(export_path)
     except Exception as e:
         print(f"  [!] Could not parse export for '{pg_tag}': {e}")
         return None
-
-    if df.empty:
-        return None
-
-    ncols = len(df.columns)
-    if ncols == 2:
-        df.columns = ['x', 'y']
-    elif ncols == 3:
-        df.columns = ['x', 'y', 'z']
-    elif ncols == 4:
-        df.columns = ['x', 'y', 'z', 'value']
-    else:
-        df.columns = [f'col{i}' for i in range(ncols)]
-    return df
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +308,7 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = ''):
 
     for entry in datasets:
         name, kind, df = entry['name'], entry['kind'], entry['df']
+        comments = entry.get('comments') or []
 
         # Multiple curves sharing one x-axis come back as long-format (x, y, group);
         # pivot to wide format (one y column per group) for proper multi-curve plotting.
@@ -236,6 +321,24 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = ''):
         sheet.from_df(df)
         if len(df.columns) >= 2:
             sheet.cols_axis('xy', repeat=True)
+
+        # Carry column names and units (parsed from 'Name (unit)' headers)
+        # over to Origin's long name / units row.
+        for i, col in enumerate(df.columns):
+            label, unit = split_label_unit(col)
+            try:
+                c = sheet.cols(i)
+                c.lname = label
+                if unit:
+                    c.units = unit
+            except Exception:
+                pass
+
+        if comments:
+            try:
+                sheet.comments = '\n'.join(comments)
+            except Exception:
+                pass
 
         if kind in ('table', '1d') and len(df.columns) >= 2:
             graph = op.new_graph(template=template) if template else op.new_graph()
@@ -314,11 +417,23 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output folder: {output_dir}")
 
-    # -- Start COMSOL server and load model --
+    # -- Pre-flight checks --
     if comsol_already_running():
-        print("WARNING: A COMSOL process is already running. Starting this "
-              "stand-alone session will launch an additional COMSOL engine "
-              "instance, using extra memory and a separate license seat.")
+        confirm_or_exit(
+            "WARNING: A COMSOL process is already running. Starting this "
+            "stand-alone session will launch an additional COMSOL engine "
+            "instance, using extra memory and a separate license seat.\n"
+            "Close the existing COMSOL session first if you want to avoid that."
+        )
+
+    if args.origin and not origin_already_running():
+        confirm_or_exit(
+            "NOTE: OriginLab does not appear to be running.\n"
+            "Start OriginLab now so --origin can connect to it (originpro "
+            "may otherwise fail to launch it automatically)."
+        )
+
+    # -- Start COMSOL server and load model --
     print(f"Starting COMSOL server...")
     client = mph.start()
     print(f"Loading model: {model_path.name}")
@@ -357,14 +472,16 @@ def main():
             label = tag
         print(f"  - {tag} ({label})")
 
-        df = extract_table(model, tag)
-        if df is not None and not df.empty:
+        result = extract_table(model, tag)
+        if result is not None and not result[0].empty:
+            df, comments = result
             name = sanitize_filename(f"table_{tag}_{label}")
             fname = name + '.csv'
-            df.to_csv(output_dir / fname, index=False)
+            write_csv_with_comments(df, output_dir / fname, comments)
             manifest['tables'].append({'tag': tag, 'label': label, 'file': fname,
-                                       'rows': len(df), 'cols': list(df.columns)})
-            datasets.append({'name': name, 'kind': 'table', 'df': df})
+                                       'rows': len(df), 'cols': list(df.columns),
+                                       'comments': comments})
+            datasets.append({'name': name, 'kind': 'table', 'df': df, 'comments': comments})
             print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
 
     # ---- Plot groups ----
@@ -388,19 +505,29 @@ def main():
         ptype = get_plot_type(pg)
         print(f"\n  [{ptype.upper():>7}] {tag} ({label})  [{class_name}]")
 
-        df = extract_via_export(model, tag, output_dir)
-        if df is not None and not df.empty:
+        result = extract_via_export(model, tag, output_dir)
+        if result is not None and not result[0].empty:
+            df, comments = result
+
+            # Prepend any user-entered "Comments" on the plot group node.
+            try:
+                note = str(pg.comments())
+                if note:
+                    comments = [note] + comments
+            except Exception:
+                pass
+
             name = sanitize_filename(f"plot{ptype}_{tag}_{label}")
             fname = name + '.csv'
-            df.to_csv(output_dir / fname, index=False)
+            write_csv_with_comments(df, output_dir / fname, comments)
             entry = {'tag': tag, 'label': label, 'file': fname,
-                     'rows': len(df), 'cols': list(df.columns)}
+                     'rows': len(df), 'cols': list(df.columns), 'comments': comments}
             if ptype in ('1d', '2d', '3d'):
                 manifest[f'{ptype}_plots'].append(entry)
             else:
                 entry['type'] = class_name
                 manifest['other'].append(entry)
-            datasets.append({'name': name, 'kind': ptype, 'df': df})
+            datasets.append({'name': name, 'kind': ptype, 'df': df, 'comments': comments})
             print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
         else:
             entry = {'tag': tag, 'label': label}
