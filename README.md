@@ -22,16 +22,16 @@ python -m venv .venv
 
 ```powershell
 # Open a file picker dialog to choose the .mph file
-.venv\Scripts\python.exe "comsol extractor.py"
+.venv\Scripts\python.exe ComsolExtractor.py
 
 # Extract a specific model
-.venv\Scripts\python.exe "comsol extractor.py" model.mph
+.venv\Scripts\python.exe ComsolExtractor.py model.mph
 
 # Choose a custom output directory
-.venv\Scripts\python.exe "comsol extractor.py" model.mph --output ./out
+.venv\Scripts\python.exe ComsolExtractor.py model.mph --output ./out
 
 # Also build an OriginLab project (.opju) from the extracted data
-.venv\Scripts\python.exe "comsol extractor.py" model.mph --origin --origin-template my_template.otpu
+.venv\Scripts\python.exe ComsolExtractor.py model.mph --origin --origin-template my_template.otpu
 ```
 
 ## Output

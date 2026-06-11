@@ -11,10 +11,10 @@ Requirements:
     - pip install originpro and OriginLab installed (only for --origin)
 
 Usage:
-    python comsol_extractor.py                          # opens file dialog
-    python comsol_extractor.py model.mph                # CLI path
-    python comsol_extractor.py model.mph --output ./out # custom output dir
-    python comsol_extractor.py model.mph --origin       # also build .opju in OriginLab
+    python ComsolExtractor.py                          # opens file dialog
+    python ComsolExtractor.py model.mph                # CLI path
+    python ComsolExtractor.py model.mph --output ./out # custom output dir
+    python ComsolExtractor.py model.mph --origin       # also build .opju in OriginLab
 
 Output is saved to a folder named <model_name>_results/ next to the .mph file.
 """
