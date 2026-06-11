@@ -1,19 +1,20 @@
 """
 COMSOL .mph Result Extractor
 =============================
-Extracts all result tables, 1D plots, and 2D plots from a COMSOL model
+Extracts all result tables and plot groups (1D/2D/3D) from a COMSOL model
 and saves them as CSV files ready for OriginLab import.
 
 Requirements:
     - COMSOL Multiphysics installed (any version 5.x / 6.x)
     - Python 3.8+
     - pip install MPh pandas numpy
+    - pip install originpro and OriginLab installed (only for --origin)
 
 Usage:
     python comsol_extractor.py                          # opens file dialog
     python comsol_extractor.py model.mph                # CLI path
     python comsol_extractor.py model.mph --output ./out # custom output dir
-    python comsol_extractor.py model.mph --origin       # also push to OriginLab
+    python comsol_extractor.py model.mph --origin       # also build .opju in OriginLab
 
 Output is saved to a folder named <model_name>_results/ next to the .mph file.
 """
@@ -63,15 +64,6 @@ def comsol_already_running() -> bool:
         if name.startswith('comsol'):
             return True
     return False
-
-
-def discover_nodes(model, root: str) -> list[str]:
-    """Return all child tags under a results node (e.g. 'results')."""
-    try:
-        tags = model.java.result().tags()
-        return [str(t) for t in tags]
-    except Exception:
-        return []
 
 
 def get_plot_type(java_plot) -> str:
@@ -133,148 +125,26 @@ def extract_table(model, tag: str) -> pd.DataFrame | None:
         return None
 
 
-def extract_1d_plot(model, pg_tag: str) -> dict[str, pd.DataFrame]:
-    """
-    Extract all line-graphs inside a 1D plot group.
-
-    For each child feature (line graph, point graph, global, etc.)
-    we call getData() or use model.evaluate() to pull x/y arrays.
-
-    Returns dict  { child_tag: DataFrame }.
-    """
-    results = {}
-    try:
-        pg = model.java.result(pg_tag)
-        child_tags_obj = pg.feature().tags()
-        child_tags = [str(t) for t in child_tags_obj]
-
-        for ctag in child_tags:
-            try:
-                feat = pg.feature(ctag)
-                # Try to use getData — works on evaluated features
-                feat_data = feat.getData()
-                if feat_data is None:
-                    pg.run()  # force evaluation
-                    feat_data = feat.getData()
-
-                if feat_data is not None:
-                    nsets = feat_data.getNumGroups()
-                    frames = []
-                    for g in range(nsets):
-                        x = np.array(feat_data.getXValues(g))
-                        y = np.array(feat_data.getYValues(g))
-                        group_label = str(feat_data.getLegend(g)) if nsets > 1 else ''
-                        df = pd.DataFrame({'x': x, 'y': y})
-                        if group_label:
-                            df['group'] = group_label
-                        frames.append(df)
-
-                    if frames:
-                        results[ctag] = pd.concat(frames, ignore_index=True)
-
-            except Exception as e:
-                print(f"    [!] Skipping child '{ctag}' in '{pg_tag}': {e}")
-
-    except Exception as e:
-        print(f"  [!] Could not process 1D plot group '{pg_tag}': {e}")
-
-    return results
-
-
-def extract_2d_plot(model, pg_tag: str, output_dir: Path) -> dict[str, pd.DataFrame]:
-    """
-    Extract data from a 2D plot group.
-
-    2D surface / contour data is trickier. Two strategies:
-      1) Export the plot as a text table via COMSOL's built-in export.
-      2) Use getData() for contour / surface children.
-
-    Returns dict { child_tag: DataFrame }.
-    """
-    results = {}
-    try:
-        pg = model.java.result(pg_tag)
-        child_tags_obj = pg.feature().tags()
-        child_tags = [str(t) for t in child_tags_obj]
-
-        for ctag in child_tags:
-            try:
-                feat = pg.feature(ctag)
-                feat_data = feat.getData()
-                if feat_data is None:
-                    pg.run()
-                    feat_data = feat.getData()
-
-                if feat_data is not None:
-                    nsets = feat_data.getNumGroups()
-                    frames = []
-                    for g in range(nsets):
-                        # 2D data typically provides (x, y, z) triplets
-                        try:
-                            x = np.array(feat_data.getXValues(g))
-                            y = np.array(feat_data.getYValues(g))
-                            z = np.array(feat_data.getZValues(g))
-                            df = pd.DataFrame({'x': x, 'y': y, 'z': z})
-                        except Exception:
-                            # Fall back to x/y only
-                            x = np.array(feat_data.getXValues(g))
-                            y = np.array(feat_data.getYValues(g))
-                            df = pd.DataFrame({'x': x, 'y': y})
-
-                        group_label = str(feat_data.getLegend(g)) if nsets > 1 else ''
-                        if group_label:
-                            df['group'] = group_label
-                        frames.append(df)
-
-                    if frames:
-                        results[ctag] = pd.concat(frames, ignore_index=True)
-
-            except Exception as e:
-                print(f"    [!] Skipping child '{ctag}' in '{pg_tag}': {e}")
-
-        # Fallback: use COMSOL's built-in export if we got nothing
-        if not results:
-            try:
-                export_path = str(output_dir / f"{sanitize_filename(pg_tag)}_export.txt")
-                export = model.java.result().export().create(
-                    f"tmp_export_{pg_tag}", "Plot"
-                )
-                export.set("plotgroup", pg_tag)
-                export.set("filename", export_path)
-                export.run()
-                model.java.result().export().remove(f"tmp_export_{pg_tag}")
-
-                df = pd.read_csv(export_path, comment='%', delim_whitespace=True,
-                                 header=None)
-                results[pg_tag + '_exported'] = df
-            except Exception:
-                pass
-
-    except Exception as e:
-        print(f"  [!] Could not process 2D plot group '{pg_tag}': {e}")
-
-    return results
-
-
 # ---------------------------------------------------------------------------
-# Alternative: export ALL via COMSOL's built-in data export
+# Plot extraction via COMSOL's built-in data export
 # ---------------------------------------------------------------------------
+#
+# The COMSOL Java client API (com.comsol.clientapi.impl.ResultFeatureClient)
+# does not expose the older Feature.getData() -> FeatureData API
+# (getXValues/getYValues/getNumGroups/...). The reliable, version-independent
+# way to pull plot data is COMSOL's built-in "Plot" data export, which writes
+# a text file with '%'-commented headers followed by numeric columns.
 
 def export_via_comsol(model, pg_tag: str, output_dir: Path) -> Path | None:
-    """
-    Use COMSOL's native export to dump a plot group to a text file.
-    Works as a universal fallback for any plot type.
-    """
+    """Use COMSOL's native 'Plot' export to dump a plot group to a text file."""
     try:
-        fname = sanitize_filename(pg_tag) + '.txt'
+        fname = sanitize_filename(pg_tag) + '_export.txt'
         export_path = output_dir / fname
 
-        # Create a temporary data export node
         export_tag = f'exp_{pg_tag}'
-        exp = model.java.result().export().create(export_tag, 'Data')
+        exp = model.java.result().export().create(export_tag, 'Plot')
         exp.set('plotgroup', pg_tag)
         exp.set('filename', str(export_path))
-        exp.set('header', 'on')
         exp.run()
         model.java.result().export().remove(export_tag)
 
@@ -282,16 +152,12 @@ def export_via_comsol(model, pg_tag: str, output_dir: Path) -> Path | None:
             return export_path
 
     except Exception as e:
-        print(f"  [!] COMSOL export fallback failed for '{pg_tag}': {e}")
+        print(f"  [!] COMSOL export failed for '{pg_tag}': {e}")
     return None
 
 
 def extract_via_export(model, pg_tag: str, output_dir: Path) -> pd.DataFrame | None:
-    """
-    Extract a plot group's data via COMSOL's native text export.
-    Used for 3D plot groups (and anything else getData() can't handle),
-    where field values are exported as plain x/y/z/value columns.
-    """
+    """Extract a plot group's data via COMSOL's native text export into a DataFrame."""
     export_path = export_via_comsol(model, pg_tag, output_dir)
     if export_path is None:
         return None
@@ -406,8 +272,6 @@ def main():
                         help='Also push CSVs into OriginLab (requires originpro)')
     parser.add_argument('--origin-template', default='',
                         help='Origin graph template (.otpu) to use')
-    parser.add_argument('--fallback-export', action='store_true',
-                        help='Use COMSOL native export as fallback for all plots')
     args = parser.parse_args()
 
     # -- Resolve model path: CLI arg or file dialog --
@@ -504,64 +368,26 @@ def main():
         ptype = get_plot_type(pg)
         print(f"\n  [{ptype.upper():>7}] {tag} ({label})  [{class_name}]")
 
-        if ptype == '1d':
-            data = extract_1d_plot(model, tag)
-            for child_tag, df in data.items():
-                name = sanitize_filename(f"plot1d_{tag}_{child_tag}")
-                fname = name + '.csv'
-                df.to_csv(output_dir / fname, index=False)
-                manifest['1d_plots'].append({
-                    'tag': tag, 'child': child_tag, 'label': label,
-                    'file': fname, 'rows': len(df), 'cols': list(df.columns)
-                })
-                datasets.append({'name': name, 'kind': '1d', 'df': df})
-                print(f"    -> Saved {fname}  ({len(df)} rows)")
-
-            # Fallback if nothing extracted
-            if not data and args.fallback_export:
-                p = export_via_comsol(model, tag, output_dir)
-                if p:
-                    print(f"    -> Fallback export: {p.name}")
-
-        elif ptype == '2d':
-            data = extract_2d_plot(model, tag, output_dir)
-            for child_tag, df in data.items():
-                name = sanitize_filename(f"plot2d_{tag}_{child_tag}")
-                fname = name + '.csv'
-                df.to_csv(output_dir / fname, index=False)
-                manifest['2d_plots'].append({
-                    'tag': tag, 'child': child_tag, 'label': label,
-                    'file': fname, 'rows': len(df), 'cols': list(df.columns)
-                })
-                datasets.append({'name': name, 'kind': '2d', 'df': df})
-                print(f"    -> Saved {fname}  ({len(df)} rows)")
-
-            if not data and args.fallback_export:
-                p = export_via_comsol(model, tag, output_dir)
-                if p:
-                    print(f"    -> Fallback export: {p.name}")
-
-        elif ptype == '3d':
-            df = extract_via_export(model, tag, output_dir)
-            if df is not None and not df.empty:
-                name = sanitize_filename(f"plot3d_{tag}")
-                fname = name + '.csv'
-                df.to_csv(output_dir / fname, index=False)
-                manifest['3d_plots'].append({
-                    'tag': tag, 'label': label,
-                    'file': fname, 'rows': len(df), 'cols': list(df.columns)
-                })
-                datasets.append({'name': name, 'kind': '3d', 'df': df})
-                print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)  [via COMSOL export]")
+        df = extract_via_export(model, tag, output_dir)
+        if df is not None and not df.empty:
+            name = sanitize_filename(f"plot{ptype}_{tag}_{label}")
+            fname = name + '.csv'
+            df.to_csv(output_dir / fname, index=False)
+            entry = {'tag': tag, 'label': label, 'file': fname,
+                     'rows': len(df), 'cols': list(df.columns)}
+            if ptype in ('1d', '2d', '3d'):
+                manifest[f'{ptype}_plots'].append(entry)
             else:
-                print(f"    [!] No data extracted for '{tag}'")
-
+                entry['type'] = class_name
+                manifest['other'].append(entry)
+            datasets.append({'name': name, 'kind': ptype, 'df': df})
+            print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
         else:
-            manifest['other'].append({'tag': tag, 'label': label, 'type': class_name})
-            if args.fallback_export:
-                p = export_via_comsol(model, tag, output_dir)
-                if p:
-                    print(f"    -> Fallback export: {p.name}")
+            entry = {'tag': tag, 'label': label}
+            if ptype not in ('1d', '2d', '3d'):
+                entry['type'] = class_name
+                manifest['other'].append(entry)
+            print(f"    [!] No data extracted for '{tag}'")
 
     # -- Write manifest --
     manifest_path = output_dir / 'manifest.json'
