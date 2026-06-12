@@ -30,58 +30,52 @@ also be run directly with `pip install -r requirements.txt` if preferred.
 .venv\Scripts\python.exe COMSOLExtractor.py
 ```
 
-With no `--comsol`/`--origin` flags, a single combined dialog appears to
-pick which steps to run - **Extract from COMSOL** and/or **Import into
-OriginLab** - and to check their availability interactively:
+With no `--comsol`/`--origin` flags, the script opens a file picker for the
+`.mph` model, starts a COMSOL server and loads it, then shows a single
+combined window with:
 
-- **OriginLab**'s LED shows green/grey depending on whether an
-  Origin/OriginPro process is currently running.
-- **COMSOL**'s LED instead reflects a real availability check: as soon as
-  the dialog renders showing "checking server availability...", it tries to
-  start a COMSOL server (`mph.start()`), then updates to green/"server
-  available" or red/"unavailable: ...". This briefly blocks the window (the
-  "OK" button is disabled until it finishes), since starting COMSOL's JVM
-  must happen on the main thread.
-- If that check succeeds and **Extract from COMSOL** stays checked, the
-  already-started server is reused for extraction - no second server is
-  launched. If COMSOL is unchecked (or the dialog is cancelled), that test
-  server is shut down again.
-- Warnings that used to be separate "press Enter to continue" prompts (e.g.
-  "OriginLab isn't running yet") are now shown inline in this same window.
+- **Status** - a green LED confirming the model loaded, plus an
+  **OriginLab** row showing whether Origin/OriginPro is currently running
+  (LED + "running"/"not running"). A **Start OriginPro** button launches
+  OriginPro (via `originpro`/COM) and re-checks its status afterwards,
+  updating the LED once it comes up. A checkbox ("Import extracted results
+  into OriginLab") controls whether the extraction is pushed into Origin
+  afterwards - ticked automatically once Origin is detected as running.
+  If a COMSOL process was already running before this session started, a
+  warning is shown here too (an extra engine instance/license seat will be
+  used).
+- **Items to extract** - the same checklist of tables/plot groups as
+  before, grouped by type (Tables / 1D / 2D / 3D Plots), all checked by
+  default.
 
-Pick whichever combination matches your situation:
+Click **Extract** to write the selected items to `<model_name>_results/`
+and, if the OriginLab checkbox is ticked, build `comsol_results.opju` in the
+same folder - which is then opened in File Explorer.
 
-- **COMSOL only** — parse the `.mph` model and write CSVs/`manifest.json`,
-  without touching OriginLab (e.g. OriginLab isn't installed here, or you
-  just want the CSVs).
-- **OriginLab only** — skip COMSOL entirely (useful if COMSOL isn't
-  installed, or its license is busy elsewhere) and instead pick an existing
-  `<model_name>_results/` folder to pack into a new OriginLab project.
-- **Both** — parse the `.mph` model, write CSVs/`manifest.json`, *and* push
-  the same in-memory data straight into OriginLab in one go.
+For the **OriginLab-only** workflow - re-importing a previously extracted
+`<model_name>_results/` folder without COMSOL (e.g. COMSOL isn't installed
+here, or its license is busy elsewhere) - use `--origin` without `--comsol`
+on the command line (see below); this skips the model/COMSOL steps entirely
+and instead prompts for the results folder to pack into a new OriginLab
+project.
 
 The same choices are available non-interactively via `--comsol` and
-`--origin` (either or both); when at least one is given on the command line,
-the dialog is skipped.
+`--origin` (either or both); `--comsol` (with or without `--origin`) still
+shows the combined window above so you can pick which items to extract and
+whether to push to OriginLab.
 
 ```powershell
 .venv\Scripts\python.exe COMSOLExtractor.py --comsol --origin
 ```
 
-This opens a file picker to choose the `.mph` model, extracts everything,
-and builds an OriginLab project (`.opju`).
+This opens a file picker to choose the `.mph` model, then the combined
+status/items window with the OriginLab checkbox pre-ticked; clicking
+**Extract** writes the CSVs and builds an OriginLab project (`.opju`).
 
-When `--comsol`/`--origin` are given directly, this skips the combined
-dialog above, but the script still checks beforehand whether COMSOL/OriginLab
-are already running and prompts if action may be needed:
-
-- If `--comsol` is selected and a COMSOL process is already running,
-  starting this script's own session will use an additional engine instance
-  and license seat — close the existing session first if you want to avoid
-  that.
-- If `--origin` is selected and OriginLab isn't running yet, start it so
-  `originpro` can connect to it.
-- Each prompt waits for Enter to continue, or Ctrl+C to abort.
+If `--origin` is given without `--comsol`, OriginLab not running yet is the
+only thing checked beforehand with a console prompt (waits for Enter to
+continue, or Ctrl+C to abort) - it's not part of the combined window since
+that path skips COMSOL/the model entirely.
 
 Other options:
 
