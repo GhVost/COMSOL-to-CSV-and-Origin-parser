@@ -188,19 +188,17 @@ def extract_table(model, tag: str) -> tuple[pd.DataFrame, list[str]] | None:
     Extract a COMSOL result table into a DataFrame, plus any user comments.
 
     Tables are stored under model.result().table(tag). Column headers
-    returned by COMSOL already include units, e.g. 'freq (GHz)'.
+    (units already included, e.g. 'freq (GHz)') come from the table's
+    'headers' property - a [index, description] matrix - while the data
+    itself comes from getTableData(True) as strings (COMSOL 6.4 dropped the
+    no-arg getTableData()/getColumnHeader()/getDoubleValue() API).
     """
     try:
         tbl = model.java.result().table(tag)
-        # Get column headers (units, e.g. "freq (GHz)", are included by COMSOL)
-        ncols = tbl.getTableData().getNumColumns()
-        headers = [str(tbl.getTableData().getColumnHeader(i)) for i in range(ncols)]
-        # Get data row by row
-        nrows = tbl.getTableData().getNumRows()
-        data = np.zeros((nrows, ncols))
-        for r in range(nrows):
-            for c in range(ncols):
-                data[r, c] = tbl.getTableData().getDoubleValue(r, c)
+        headers = [str(row[1]) for row in tbl.getStringMatrix('headers')]
+
+        rows = tbl.getTableData(True)
+        data = np.array([[float(str(cell)) for cell in row] for row in rows], dtype=float)
 
         df = pd.DataFrame(data, columns=headers)
 
@@ -381,8 +379,43 @@ def split_header_line(header_line: str, ncols: int) -> list[str] | None:
     return parts if len(parts) == ncols else None
 
 
+def get_table_graph_headers(model, pg) -> list[str] | None:
+    """Return column headers for a 'Probe Table Graph' plot from its source table.
+
+    A Table Graph feature (source='table') plots columns of a result table
+    (table='tbl1') rather than computing its own expressions: 'xaxisdata' is
+    the 1-indexed x-axis column and 'plotcolumns' the 1-indexed y-axis
+    column(s). The table's own 'headers' property already has each column's
+    'Description (unit)' text, which COMSOL's plot export sometimes fails to
+    write into the export file's header line (e.g. single-curve probe
+    plots) - use that as the authoritative source in [x, *ys] order.
+    """
+    try:
+        for ftag in pg.feature().tags():
+            feat = pg.feature(str(ftag))
+            names = {str(n) for n in feat.properties()}
+            if not {'source', 'table', 'xaxisdata', 'plotcolumns'} <= names:
+                continue
+            if str(feat.getString('source')) != 'table':
+                continue
+
+            tbl = model.java.result().table(str(feat.getString('table')))
+            table_headers = [str(row[1]) for row in tbl.getStringMatrix('headers')]
+
+            x_idx = int(feat.getInt('xaxisdata')) - 1
+            y_idx = [int(i) - 1 for i in feat.getIntArray('plotcolumns')]
+            cols = [x_idx] + y_idx
+            if all(0 <= i < len(table_headers) for i in cols):
+                return [table_headers[i] for i in cols]
+    except Exception:
+        pass
+
+    return None
+
+
 def parse_comsol_export(path: Path, units_map: dict[str, str] | None = None,
-                         coordinate_unit: str = '') -> tuple[pd.DataFrame, list[str]] | None:
+                         coordinate_unit: str = '',
+                         fallback_headers: list[str] | None = None) -> tuple[pd.DataFrame, list[str]] | None:
     """Parse a COMSOL text export into (DataFrame, metadata comment lines).
 
     COMSOL prefixes the file with '%' lines holding metadata (Model, Version,
@@ -396,6 +429,10 @@ def parse_comsol_export(path: Path, units_map: dict[str, str] | None = None,
     fills those in by matching the column's name. Spatial-coordinate columns
     (see COORDINATE_NAMES) fall back to coordinate_unit (see
     get_geometry_length_unit), since they carry no feature property at all.
+
+    If the export's own header line is missing or unusable, fallback_headers
+    (see get_table_graph_headers) is used instead, when its length matches
+    the data's column count.
     """
     text = repair_mojibake(path.read_text(encoding='utf-8', errors='replace'))
     comment_lines = [line[1:].strip() for line in text.splitlines() if line.startswith('%')]
@@ -413,6 +450,9 @@ def parse_comsol_export(path: Path, units_map: dict[str, str] | None = None,
         headers = split_header_line(comment_lines[-1], len(df.columns))
         if headers is not None:
             meta = comment_lines[:-1]
+
+    if headers is None and fallback_headers and len(fallback_headers) == len(df.columns):
+        headers = fallback_headers
 
     if headers:
         if units_map or coordinate_unit:
@@ -447,7 +487,8 @@ def extract_via_export(model, pg, pg_tag: str, output_dir: Path) -> tuple[pd.Dat
         return None
 
     try:
-        return parse_comsol_export(export_path, get_feature_units(pg), get_geometry_length_unit(model, pg))
+        return parse_comsol_export(export_path, get_feature_units(pg), get_geometry_length_unit(model, pg),
+                                    get_table_graph_headers(model, pg))
     except Exception as e:
         print(f"  [!] Could not parse export for '{pg_tag}': {e}")
         return None
