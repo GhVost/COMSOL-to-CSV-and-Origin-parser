@@ -799,6 +799,7 @@ def run_extraction_window(model_path: Path, comsol_warning: str | None,
     """
     import queue
     import threading
+    import time
     import tkinter as tk
     from tkinter import ttk
 
@@ -899,7 +900,7 @@ def run_extraction_window(model_path: Path, comsol_warning: str | None,
     status_bar.pack(fill='x', pady=(8, 0))
 
     variables = []
-    state = {'client': None, 'model': None, 'items': []}
+    state = {'client': None, 'model': None, 'items': [], 'status_text': "Starting COMSOL server..."}
 
     def populate_items(items):
         # One checkbox per item, grouped under bold headings by kind; a new
@@ -949,6 +950,7 @@ def run_extraction_window(model_path: Path, comsol_warning: str | None,
 
     # -- Start COMSOL, load the model, and discover items in the background --
     msg_queue = queue.Queue()
+    worker_start = time.monotonic()
 
     def worker():
         try:
@@ -969,6 +971,7 @@ def run_extraction_window(model_path: Path, comsol_warning: str | None,
             while True:
                 msg = msg_queue.get_nowait()
                 if msg[0] == 'status':
+                    state['status_text'] = msg[1]
                     status_bar.configure(text=msg[1])
                 elif msg[0] == 'ready':
                     _, client, model, items = msg
@@ -990,7 +993,8 @@ def run_extraction_window(model_path: Path, comsol_warning: str | None,
                     print(f"\n[!] {msg[1]}")
                     return
         except queue.Empty:
-            pass
+            elapsed = int(time.monotonic() - worker_start)
+            status_bar.configure(text=f"{state['status_text']} ({elapsed}s)")
         root.after(150, poll_worker)
 
     root.after(150, poll_worker)
@@ -1090,9 +1094,9 @@ def main():
     comsol_warning = None
     if comsol_already_running():
         comsol_warning = (
-            "A COMSOL process is already running - this session will launch "
-            "an additional engine instance, using extra memory and a "
-            "separate license seat."
+            "Another COMSOL process is already running on this PC - this "
+            "session will start an additional engine instance (uses more "
+            "memory and may take a bit longer to start)."
         )
 
     # -- Combined status + item-selection window, shown immediately --
