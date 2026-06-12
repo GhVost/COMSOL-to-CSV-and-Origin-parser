@@ -24,9 +24,10 @@ Requirements:
 Usage:
     python ComsolExtractor.py --origin
 
-Opens a file dialog to pick the .mph model, then extracts everything and
-builds an OriginLab project. A model path, --output <dir> and
---origin-template <file> can also be given; see --help for details.
+Opens a file dialog to pick the .mph model, then a checklist window listing
+every table and plot group found in the model - pick which ones to extract,
+and optionally build an OriginLab project from them. A model path, --output
+<dir> and --origin-template <file> can also be given; see --help for details.
 
 Output is saved to a folder named <model_name>_results/ next to the .mph file.
 """
@@ -504,6 +505,90 @@ def pick_file_dialog() -> Path | None:
     return Path(file_path) if file_path else None
 
 
+# Display names for the groups shown in the item-picker, in the order shown.
+ITEM_GROUP_LABELS = {
+    'table': 'Tables',
+    '1d': '1D Plots',
+    '2d': '2D Plots',
+    '3d': '3D Plots',
+}
+
+
+def pick_items_dialog(items: list[dict]) -> list[dict] | None:
+    """Show a checklist of extractable tables/plot groups, grouped by type.
+
+    Every item is checked by default. Returns the selected items, or None
+    if the user cancelled (closed the window or clicked Cancel).
+    """
+    import tkinter as tk
+    from tkinter import ttk
+
+    root = tk.Tk()
+    root.title("Select results to extract")
+    root.attributes('-topmost', True)
+    root.geometry('480x480')
+
+    container = ttk.Frame(root, padding=10)
+    container.pack(fill='both', expand=True)
+
+    ttk.Label(container, text="Select which tables/plots to extract:").pack(anchor='w')
+
+    list_frame = ttk.Frame(container)
+    list_frame.pack(fill='both', expand=True, pady=(5, 0))
+
+    canvas = tk.Canvas(list_frame, borderwidth=0, highlightthickness=0)
+    scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=canvas.yview)
+    inner = ttk.Frame(canvas)
+    inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+    canvas.create_window((0, 0), window=inner, anchor='nw')
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side='left', fill='both', expand=True)
+    scrollbar.pack(side='right', fill='y')
+
+    variables = []
+    last_group = None
+    for item in items:
+        group = item['kind'] if item['kind'] in ITEM_GROUP_LABELS else 'other'
+        if group != last_group:
+            ttk.Label(inner, text=ITEM_GROUP_LABELS.get(group, 'Other'),
+                      font=('TkDefaultFont', 9, 'bold')).pack(
+                anchor='w', pady=(8 if last_group else 0, 2))
+            last_group = group
+        var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(inner, text=f"{item['tag']}: {item['label']}", variable=var).pack(
+            anchor='w', padx=(10, 0))
+        variables.append(var)
+
+    result = {'items': None}
+
+    def select_all():
+        for v in variables:
+            v.set(True)
+
+    def deselect_all():
+        for v in variables:
+            v.set(False)
+
+    def on_extract():
+        result['items'] = [item for item, v in zip(items, variables) if v.get()]
+        root.destroy()
+
+    def on_cancel():
+        result['items'] = None
+        root.destroy()
+
+    btn_frame = ttk.Frame(container)
+    btn_frame.pack(fill='x', pady=(10, 0))
+    ttk.Button(btn_frame, text="Select All", command=select_all).pack(side='left')
+    ttk.Button(btn_frame, text="Deselect All", command=deselect_all).pack(side='left', padx=5)
+    ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side='right')
+    ttk.Button(btn_frame, text="Extract", command=on_extract).pack(side='right', padx=5)
+
+    root.protocol('WM_DELETE_WINDOW', on_cancel)
+    root.mainloop()
+    return result['items']
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Extract results from a COMSOL .mph file'
@@ -577,44 +662,25 @@ def main():
     # -- Discover result nodes --
     java_result = model.java.result()
 
-    # ---- Tables ----
-    output_dir.mkdir(parents=True, exist_ok=True)
     try:
-        tbl_tags_obj = java_result.table().tags()
-        tbl_tags = [str(t) for t in tbl_tags_obj]
+        tbl_tags = [str(t) for t in java_result.table().tags()]
     except Exception as e:
         print(f"  [!] Could not list result tables: {e}")
         tbl_tags = []
 
-    if tbl_tags:
-        print(f"Found {len(tbl_tags)} result table(s):")
+    try:
+        pg_tags = [str(t) for t in java_result.tags()]
+    except Exception as e:
+        print(f"  [!] Could not list plot groups: {e}")
+        pg_tags = []
+
+    items = []
     for tag in tbl_tags:
         try:
             label = str(java_result.table(tag).label())
         except Exception:
             label = tag
-        print(f"  - {tag} ({label})")
-
-        result = extract_table(model, tag)
-        if result is not None and not result[0].empty:
-            df, comments = result
-            name = sanitize_filename(f"table_{tag}_{label}")
-            fname = name + '.csv'
-            write_csv_with_comments(df, output_dir / fname, comments)
-            manifest['tables'].append({'tag': tag, 'label': label, 'file': fname,
-                                       'rows': len(df), 'cols': list(df.columns),
-                                       'comments': comments})
-            datasets.append({'name': name, 'kind': 'table', 'df': df, 'comments': comments})
-            print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
-
-    # ---- Plot groups ----
-    output_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        pg_tags_obj = java_result.tags()
-        pg_tags = [str(t) for t in pg_tags_obj]
-    except Exception as e:
-        print(f"  [!] Could not list plot groups: {e}")
-        pg_tags = []
+        items.append({'tag': tag, 'label': label, 'kind': 'table'})
 
     for tag in pg_tags:
         try:
@@ -624,8 +690,42 @@ def main():
         except Exception as e:
             print(f"  [!] Could not access plot group '{tag}': {e}")
             continue
+        items.append({'tag': tag, 'label': label, 'kind': get_plot_type(pg),
+                       'class_name': class_name, 'pg': pg})
 
-        ptype = get_plot_type(pg)
+    if not items:
+        client.clear()
+        sys.exit("No extractable tables or plot groups found in this model.")
+
+    # -- Let the user pick which results to extract --
+    print(f"Found {len(items)} extractable item(s). Opening selection window...")
+    selected = pick_items_dialog(items)
+    if not selected:
+        print("Nothing selected. Exiting.")
+        client.clear()
+        return
+
+    # ---- Extract selected items ----
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for item in selected:
+        tag, label, kind = item['tag'], item['label'], item['kind']
+
+        if kind == 'table':
+            print(f"  - {tag} ({label})")
+            result = extract_table(model, tag)
+            if result is not None and not result[0].empty:
+                df, comments = result
+                name = sanitize_filename(f"table_{tag}_{label}")
+                fname = name + '.csv'
+                write_csv_with_comments(df, output_dir / fname, comments)
+                manifest['tables'].append({'tag': tag, 'label': label, 'file': fname,
+                                           'rows': len(df), 'cols': list(df.columns),
+                                           'comments': comments})
+                datasets.append({'name': name, 'kind': 'table', 'df': df, 'comments': comments})
+                print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
+            continue
+
+        pg, class_name, ptype = item['pg'], item['class_name'], kind
         print(f"\n  [{ptype.upper():>7}] {tag} ({label})  [{class_name}]")
 
         result = extract_via_export(model, pg, tag, output_dir)
