@@ -51,12 +51,21 @@ Results are written to `<model_name>_results/` next to the `.mph` file:
 ## How it works
 
 - `MPh` starts a COMSOL session and loads the model.
-- Result tables are read directly via COMSOL's table API, which already
-  includes column headers with units.
+- Result tables are read directly via COMSOL's table API: row data comes
+  from `getTableData(True)`, and column names/units come from the table's
+  `headers` property (a `[index, "Description (unit)"]` matrix). Older
+  no-arg `getTableData()`/`getColumnHeader()`/`getDoubleValue()` calls were
+  removed in COMSOL 6.4, so this is the version-independent approach.
 - Plot group data (1D/2D/3D) is pulled using COMSOL's built-in "Plot" data
   export, which is more reliable across COMSOL versions than the
   feature-level data API. The exported `%`-commented header line is parsed
   to recover per-column names and units.
+- Some plot types don't get a usable header line from the export at all -
+  notably single-curve "Probe Table Graph" plots, which read columns
+  straight from a result table. For these, column headers are instead taken
+  from the source table's `headers` property, picked out via the plot
+  feature's `xaxisdata` (x-axis column) and `plotcolumns` (y-axis column(s))
+  properties.
 - If `--origin` is given, the in-memory data is pushed straight into Origin
   via `originpro` (COM automation) — no CSV round-trip needed. Column long
   names/units and the comments are applied to each worksheet.
