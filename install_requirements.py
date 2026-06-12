@@ -6,9 +6,10 @@ Usage:
 
 Installs into whichever Python environment runs this script (e.g. activate
 a virtual environment first if you want one). Installs everything listed in
-requirements.txt - MPh, pandas, numpy, psutil (required) and originpro
-(optional, for --origin). If originpro fails to install, this is reported
-as a warning rather than an error, since --comsol-only use doesn't need it.
+requirements.txt - MPh, pandas, numpy, psutil (required), and originpro and
+pyinstaller (optional, for --origin and for building a standalone .exe
+respectively). If an optional package fails to install, this is reported as
+a warning rather than an error, since --comsol-only use doesn't need either.
 """
 
 import subprocess
@@ -16,7 +17,7 @@ import sys
 from pathlib import Path
 
 REQUIREMENTS_FILE = Path(__file__).resolve().parent / 'requirements.txt'
-OPTIONAL_PACKAGES = {'originpro'}
+OPTIONAL_PACKAGES = {'originpro', 'pyinstaller'}
 
 
 def pip_install(*args: str) -> bool:
@@ -51,7 +52,8 @@ def main():
         print(f"\nInstalling optional package: {name}")
         if not pip_install(name):
             print(f"[!] Failed to install '{name}' - this is only needed for "
-                  f"--origin, so --comsol-only use is unaffected.")
+                  f"--origin or for building a standalone .exe, so running "
+                  f"ComsolExtractor.py directly is unaffected.")
 
     print("\nDone.")
 

@@ -47,6 +47,8 @@ Module layout (in order):
                             everything together and writes manifest.json.
 """
 
+__version__ = '1.1.0'
+
 import argparse
 import sys
 import re
@@ -1168,6 +1170,7 @@ def main():
     parser = argparse.ArgumentParser(
         description='Extract results from a COMSOL .mph file and/or import them into OriginLab'
     )
+    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     parser.add_argument('model', nargs='?', default=None,
                         help='Path to .mph file (opens file dialog if omitted)')
     parser.add_argument('--output', '-o', default=None,

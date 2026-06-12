@@ -89,6 +89,24 @@ Other options:
   the file dialog)
 - `--output ./out` — custom output directory (COMSOL mode)
 - `--origin-template my_template.otpu` — Origin graph template for line plots
+- `--version` — print the version and exit
+
+## Building a standalone executable
+
+A single-file `ComsolExtractor.exe` can be built with
+[PyInstaller](https://pyinstaller.org/), so it can run without a Python
+install (COMSOL Multiphysics and/or OriginLab are still required separately
+- see Disclaimer).
+
+```powershell
+.venv\Scripts\python install_requirements.py
+.venv\Scripts\python build_exe.py
+```
+
+This runs PyInstaller against `ComsolExtractor.spec` and writes
+`dist\ComsolExtractor.exe`. The version shown in its file properties
+(and by `--version`) comes from `__version__` in `ComsolExtractor.py` and
+`version_info.txt` - keep both in sync when bumping the version.
 
 ## Output
 
