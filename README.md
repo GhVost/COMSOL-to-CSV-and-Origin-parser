@@ -17,8 +17,12 @@ Install everything into a virtual environment:
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\pip install MPh pandas numpy psutil originpro
+.venv\Scripts\python install_requirements.py
 ```
+
+`install_requirements.py` installs everything listed in `requirements.txt`
+(`MPh`, `pandas`, `numpy`, `psutil`, and the optional `originpro`). It can
+also be run directly with `pip install -r requirements.txt` if preferred.
 
 ## Usage
 

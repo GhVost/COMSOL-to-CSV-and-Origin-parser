@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 *_results/
+hs_err_pid*.log
