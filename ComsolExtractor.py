@@ -159,6 +159,39 @@ def write_csv_with_comments(df: pd.DataFrame, path: Path, comments: list[str] | 
             writer.writerow(row)
 
 
+def load_dataset_csv(path: Path) -> tuple[pd.DataFrame, list[str]]:
+    """Read a CSV written by write_csv_with_comments() back into a
+    (DataFrame, comments) pair.
+
+    This is the reverse operation: leading '%' lines are read back as
+    comments, and the following two header rows (column names, then units)
+    are recombined into single 'Name (unit)' column headers - so the
+    DataFrame looks the same as one freshly extracted from COMSOL. Used to
+    re-import a previously extracted '<model>_results' folder into OriginLab
+    without needing COMSOL running again.
+    """
+    with open(path, 'r', encoding='utf-8', newline='') as f:
+        lines = f.readlines()
+
+    # Leading '%' lines are metadata/comments, same convention as COMSOL's
+    # own text exports.
+    comments = []
+    i = 0
+    while i < len(lines) and lines[i].startswith('%'):
+        comments.append(lines[i][1:].strip())
+        i += 1
+
+    # The next two rows are the column names and units written by
+    # write_csv_with_comments(); zip them back into 'Name (unit)' headers
+    # (or just 'Name' if there's no unit for that column).
+    names = next(csv.reader([lines[i]]))
+    units = next(csv.reader([lines[i + 1]]))
+    headers = [f"{name} ({unit})" if unit else name for name, unit in zip(names, units)]
+
+    df = pd.read_csv(path, skiprows=i + 2, header=None, names=headers)
+    return df, comments
+
+
 def comsol_already_running() -> bool:
     """Check whether a COMSOL Desktop/server process is already running."""
     if psutil is None:
@@ -653,6 +686,53 @@ def extract_via_export(model, pg, pg_tag: str, output_dir: Path) -> tuple[pd.Dat
 # OriginLab integration (optional)
 # ---------------------------------------------------------------------------
 
+def load_datasets_from_folder(folder: Path) -> list[dict]:
+    """Load CSVs from a previously written '<model>_results' folder for
+    direct OriginLab import via push_to_origin(), without re-running the
+    COMSOL extraction (e.g. when COMSOL isn't installed/licensed on this
+    machine, or its license is busy elsewhere).
+
+    Uses manifest.json to find each extracted file and which section
+    (tables/1d_plots/2d_plots/3d_plots/other) it belongs to, then reads it
+    back with load_dataset_csv().
+    """
+    manifest_path = folder / 'manifest.json'
+    if not manifest_path.exists():
+        sys.exit(f"No manifest.json found in {folder} - pick a '<model>_results' folder.")
+
+    with open(manifest_path, 'r', encoding='utf-8') as f:
+        manifest = json.load(f)
+
+    # Map each manifest section to the 'kind' push_to_origin() expects:
+    # 'table'/'1d' additionally get a line graph, the rest just a worksheet.
+    section_kinds = {
+        'tables': 'table',
+        '1d_plots': '1d',
+        '2d_plots': '2d',
+        '3d_plots': '3d',
+        'other': 'other',
+    }
+
+    datasets = []
+    for section, kind in section_kinds.items():
+        for entry in manifest.get(section, []):
+            fname = entry.get('file')
+            if not fname:
+                # Entries without a 'file' key represent failed extractions
+                # recorded for diagnostics only - nothing to load.
+                continue
+            path = folder / fname
+            if not path.exists():
+                print(f"  [!] Missing file referenced in manifest: {fname}")
+                continue
+            df, comments = load_dataset_csv(path)
+            datasets.append({'name': Path(fname).stem, 'kind': kind, 'df': df,
+                              'comments': comments or entry.get('comments', [])})
+            print(f"  - Loaded {fname}  ({len(df)} rows x {len(df.columns)} cols)")
+
+    return datasets
+
+
 def push_to_origin(datasets: list, output_dir: Path, template: str = ''):
     """
     Build an OriginLab project directly from extracted DataFrames.
@@ -749,6 +829,95 @@ def pick_file_dialog() -> Path | None:
     root.destroy()
     # askopenfilename() returns '' if the user cancelled.
     return Path(file_path) if file_path else None
+
+
+def pick_folder_dialog(title: str) -> Path | None:
+    """Open a native folder-picker dialog and return the selected directory."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError:
+        return None
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    folder = filedialog.askdirectory(title=title)
+    root.destroy()
+    # askdirectory() returns '' if the user cancelled.
+    return Path(folder) if folder else None
+
+
+def pick_mode_dialog() -> dict | None:
+    """Show a small dialog to choose which steps to run: extracting from a
+    COMSOL model (--comsol) and/or importing results into OriginLab
+    (--origin), shown when neither option was given on the command line.
+
+    Each option has a status LED - green if a matching COMSOL/OriginLab
+    process is currently running, grey otherwise - so the user can decide
+    accordingly (e.g. pick Origin-only if COMSOL's license is busy
+    elsewhere, or COMSOL-only if OriginLab isn't installed on this machine).
+
+    Returns {'comsol': bool, 'origin': bool}, or None if the user cancelled.
+    At least one of the two must be selected to proceed.
+    """
+    import tkinter as tk
+    from tkinter import ttk
+
+    root = tk.Tk()
+    root.title("Select extraction steps")
+    root.attributes('-topmost', True)
+    root.resizable(False, False)
+
+    container = ttk.Frame(root, padding=15)
+    container.pack(fill='both', expand=True)
+
+    ttk.Label(container, text="Choose which steps to run:",
+              font=('TkDefaultFont', 9, 'bold')).grid(
+        row=0, column=0, columnspan=3, sticky='w', pady=(0, 10))
+
+    comsol_var = tk.BooleanVar(value=True)
+    origin_var = tk.BooleanVar(value=False)
+
+    def add_row(row: int, text: str, var: tk.BooleanVar, running: bool):
+        ttk.Checkbutton(container, text=text, variable=var).grid(
+            row=row, column=0, sticky='w', pady=3)
+        # A small filled circle: green when the process is running, grey
+        # when it isn't - the "LED" the user can check at a glance.
+        led = tk.Canvas(container, width=14, height=14, highlightthickness=0)
+        led.create_oval(2, 2, 12, 12, fill=('#2ecc40' if running else '#b0b0b0'), outline='')
+        led.grid(row=row, column=1, padx=(15, 5))
+        ttk.Label(container, text='running' if running else 'not running').grid(
+            row=row, column=2, sticky='w')
+
+    add_row(1, "Extract from COMSOL (--comsol)", comsol_var, comsol_already_running())
+    add_row(2, "Import into OriginLab (--origin)", origin_var, origin_already_running())
+
+    hint = ttk.Label(container, text="Select at least one option.", foreground='#888888')
+    hint.grid(row=3, column=0, columnspan=3, sticky='w', pady=(8, 0))
+
+    result = {'mode': None}
+
+    def on_ok():
+        if not comsol_var.get() and not origin_var.get():
+            # Refuse to close with nothing selected - flag it instead.
+            hint.configure(text="Select at least one option.", foreground='#cc0000')
+            return
+        result['mode'] = {'comsol': comsol_var.get(), 'origin': origin_var.get()}
+        root.destroy()
+
+    def on_cancel():
+        result['mode'] = None
+        root.destroy()
+
+    btn_frame = ttk.Frame(container)
+    btn_frame.grid(row=4, column=0, columnspan=3, pady=(15, 0), sticky='e')
+    ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side='right')
+    ttk.Button(btn_frame, text="OK", command=on_ok).pack(side='right', padx=(0, 5))
+
+    root.protocol('WM_DELETE_WINDOW', on_cancel)
+    root.mainloop()
+    return result['mode']
 
 
 # Display names for the groups shown in the item-picker, in the order shown.
@@ -851,17 +1020,58 @@ def pick_items_dialog(items: list[dict]) -> list[dict] | None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Extract results from a COMSOL .mph file'
+        description='Extract results from a COMSOL .mph file and/or import them into OriginLab'
     )
     parser.add_argument('model', nargs='?', default=None,
                         help='Path to .mph file (opens file dialog if omitted)')
     parser.add_argument('--output', '-o', default=None,
                         help='Output directory (default: folder next to .mph named <model>_results/)')
+    parser.add_argument('--comsol', action='store_true',
+                        help='Extract results from a COMSOL .mph model')
     parser.add_argument('--origin', action='store_true',
-                        help='Also push CSVs into OriginLab (requires originpro)')
+                        help='Import results into OriginLab (requires originpro)')
     parser.add_argument('--origin-template', default='',
                         help='Origin graph template (.otpu) to use')
     args = parser.parse_args()
+
+    # -- Decide which steps to run --
+    # If neither --comsol nor --origin was given, ask via a small GUI that
+    # also shows whether COMSOL/OriginLab are currently running (e.g. so the
+    # user can pick Origin-only if COMSOL's license is busy elsewhere).
+    if args.comsol or args.origin:
+        do_comsol, do_origin = args.comsol, args.origin
+    else:
+        mode = pick_mode_dialog()
+        if mode is None:
+            sys.exit("Nothing selected. Exiting.")
+        do_comsol, do_origin = mode['comsol'], mode['origin']
+
+    if not do_comsol:
+        # -- OriginLab-only mode: import a previously extracted folder --
+        # (do_origin is guaranteed True here - the dialog/CLI logic above
+        # requires at least one of the two steps.)
+        if not origin_already_running():
+            confirm_or_exit(
+                "NOTE: OriginLab does not appear to be running.\n"
+                "Start OriginLab now so --origin can connect to it (originpro "
+                "may otherwise fail to launch it automatically)."
+            )
+
+        print("Select the '<model>_results' folder to import into OriginLab...")
+        folder = pick_folder_dialog("Select results folder to import into OriginLab")
+        if folder is None:
+            sys.exit("No folder selected. Exiting.")
+        folder = folder.resolve()
+
+        print(f"Loading datasets from: {folder}")
+        datasets = load_datasets_from_folder(folder)
+        if not datasets:
+            sys.exit("No datasets found to import.")
+
+        print("\nPushing results to OriginLab...")
+        push_to_origin(datasets, folder, template=args.origin_template)
+        print("Done.")
+        return
 
     # -- Resolve model path: CLI arg or file dialog --
     if args.model:
@@ -894,7 +1104,7 @@ def main():
             "Close the existing COMSOL session first if you want to avoid that."
         )
 
-    if args.origin and not origin_already_running():
+    if do_origin and not origin_already_running():
         confirm_or_exit(
             "NOTE: OriginLab does not appear to be running.\n"
             "Start OriginLab now so --origin can connect to it (originpro "
@@ -1061,7 +1271,7 @@ def main():
     print(f"{'='*50}")
 
     # -- Optional: push to OriginLab --
-    if args.origin:
+    if do_origin:
         print("\nPushing results to OriginLab...")
         push_to_origin(datasets, output_dir, template=args.origin_template)
 
