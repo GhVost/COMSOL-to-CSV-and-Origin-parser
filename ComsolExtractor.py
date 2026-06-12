@@ -72,11 +72,26 @@ def sanitize_filename(name: str) -> str:
 
 
 def split_label_unit(label: str) -> tuple[str, str]:
-    """Split a 'Name (unit)' or 'Name [unit]' column header into ('Name', 'unit')."""
-    m = re.match(r'^(.*?)\s*[(\[]([^()\[\]]*)[)\]]\s*$', str(label).strip())
+    """Split a column header into (name, unit).
+
+    Most COMSOL headers end in '(unit)'/'[unit]', e.g. 'Displacement
+    magnitude (µm)'. Multi-curve 'Table graph' exports instead append a
+    per-curve label after the unit, e.g. 'Kinetic energy density (J/m^3),
+    ring' - if no unit is found at the end, fall back to pulling the first
+    '(unit)'/'[unit]' out of the middle of the string.
+    """
+    label = str(label).strip()
+    m = re.match(r'^(.*?)\s*[(\[]([^()\[\]]*)[)\]]\s*$', label)
     if m:
         return m.group(1).strip(), m.group(2).strip()
-    return str(label).strip(), ''
+
+    m = re.search(r'[(\[]([^()\[\]]*)[)\]]', label)
+    if not m:
+        return label, ''
+    name = label[:m.start()] + label[m.end():]
+    name = re.sub(r'\s{2,}', ' ', name)
+    name = re.sub(r'\s*,\s*', ', ', name)
+    return name.strip(' ,'), m.group(1).strip()
 
 
 def repair_mojibake(text: str) -> str:
@@ -340,6 +355,32 @@ def get_geometry_length_unit(model, pg) -> str:
         return ''
 
 
+def split_header_line(header_line: str, ncols: int) -> list[str] | None:
+    """Split a COMSOL '%' header line into ncols column headers, or None if
+    that isn't possible.
+
+    Headers are normally separated by runs of 2+ spaces (a unit's own
+    parentheses use single spaces). Multi-curve 'Table graph' exports
+    instead repeat 'Description (unit), <curve label>' back-to-back with
+    single spaces and no inter-header padding; detect that by splitting on
+    repeats of the '<description> (<unit>), ' prefix.
+    """
+    candidate = re.split(r'\s{2,}', header_line.strip())
+    if len(candidate) == ncols:
+        return candidate
+
+    parts = []
+    for piece in candidate:
+        m = re.match(r'^(.*?[(\[][^()\[\]]*[)\]],\s*)', piece)
+        if not m:
+            parts.append(piece)
+            continue
+        prefix = m.group(1)
+        parts.extend(s.strip() for s in re.split(f'(?={re.escape(prefix)})', piece) if s.strip())
+
+    return parts if len(parts) == ncols else None
+
+
 def parse_comsol_export(path: Path, units_map: dict[str, str] | None = None,
                          coordinate_unit: str = '') -> tuple[pd.DataFrame, list[str]] | None:
     """Parse a COMSOL text export into (DataFrame, metadata comment lines).
@@ -369,9 +410,8 @@ def parse_comsol_export(path: Path, units_map: dict[str, str] | None = None,
     headers = None
     meta = comment_lines
     if comment_lines:
-        candidate = re.split(r'\s{2,}', comment_lines[-1].strip())
-        if len(candidate) == len(df.columns):
-            headers = candidate
+        headers = split_header_line(comment_lines[-1], len(df.columns))
+        if headers is not None:
             meta = comment_lines[:-1]
 
     if headers:
