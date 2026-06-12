@@ -4,12 +4,16 @@ COMSOL .mph Result Extractor
 Extracts all result tables and plot groups (1D/2D/3D) from a COMSOL model
 and saves them as CSV files ready for OriginLab import.
 
-Each CSV keeps COMSOL's column headers, including units (e.g.
-'Total displacement (m)'), and any model/description metadata or user
-"Comments" are written as leading '%' comment lines and recorded in
-manifest.json. With --origin, those headers/units are also applied to the
-Origin worksheet's long name / units row, and the comments to the sheet's
-comments.
+Each CSV starts with any model/description metadata or user "Comments" as
+leading '%' comment lines (also recorded in manifest.json), followed by two
+header rows - column names and units, split from COMSOL's combined
+'Name (unit)' / 'Name [unit]' column headers - and then the data. Units that
+COMSOL stores as a separate plot-feature property (not in the header text),
+or that belong to spatial-coordinate columns (R, X, Y, Z, ...) and come from
+the geometry's length unit, are filled in from the model, and mis-encoded
+unit symbols (e.g. 'Âµm') are repaired. With --origin, those names/units are
+applied to the Origin worksheet's long name and units label rows, and the
+comments to the sheet's comments.
 
 Requirements:
     - COMSOL Multiphysics installed (any version 5.x / 6.x)
@@ -30,6 +34,7 @@ Output is saved to a folder named <model_name>_results/ next to the .mph file.
 import argparse
 import sys
 import re
+import csv
 import json
 import shutil
 import tempfile
@@ -66,19 +71,35 @@ def sanitize_filename(name: str) -> str:
 
 
 def split_label_unit(label: str) -> tuple[str, str]:
-    """Split a 'Name (unit)' column header into ('Name', 'unit')."""
-    m = re.match(r'^(.*?)\s*\(([^()]*)\)\s*$', str(label).strip())
+    """Split a 'Name (unit)' or 'Name [unit]' column header into ('Name', 'unit')."""
+    m = re.match(r'^(.*?)\s*[(\[]([^()\[\]]*)[)\]]\s*$', str(label).strip())
     if m:
         return m.group(1).strip(), m.group(2).strip()
     return str(label).strip(), ''
 
 
+def repair_mojibake(text: str) -> str:
+    """Fix text COMSOL's export wrote as UTF-8 bytes re-interpreted as
+    Windows-1252 (e.g. the unit 'µm' coming out as 'Âµm')."""
+    try:
+        return text.encode('cp1252').decode('utf-8')
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return text
+
+
 def write_csv_with_comments(df: pd.DataFrame, path: Path, comments: list[str] | None = None):
-    """Write a DataFrame to CSV with COMSOL metadata as leading '%' comment lines."""
-    with open(path, 'w', encoding='utf-8') as f:
+    """Write a DataFrame to CSV with COMSOL metadata as leading '%' comment lines,
+    followed by a row of column names and a row of units (split from the
+    'Name (unit)' headers), then the data."""
+    names, units = zip(*(split_label_unit(col) for col in df.columns))
+    with open(path, 'w', encoding='utf-8', newline='') as f:
         for line in comments or []:
             f.write(f"% {line}\n")
-        df.to_csv(f, index=False)
+        writer = csv.writer(f)
+        writer.writerow(names)
+        writer.writerow(units)
+        for row in df.itertuples(index=False, name=None):
+            writer.writerow(row)
 
 
 def comsol_already_running() -> bool:
@@ -229,7 +250,97 @@ def export_via_comsol(model, pg_tag: str, output_dir: Path) -> Path | None:
     return None
 
 
-def parse_comsol_export(path: Path) -> tuple[pd.DataFrame, list[str]] | None:
+def get_feature_units(pg) -> dict[str, str]:
+    """Map each axis description/expression to its COMSOL 'unit' property.
+
+    A plot feature (e.g. Line Graph, Surface, or a nested Deformation
+    sub-feature) can carry a unit as a property separate from its
+    description/expression - COMSOL's text export omits such units from the
+    column header entirely. COMSOL pairs these by name prefix, e.g.
+    'unit'/'descr'/'expr' for a feature's main expression, or
+    'xdataunit'/'xdatadescr'/'xdataexpr' for its x-axis. A 'unit' property
+    can also be a string array (e.g. a Deformation sub-feature's per-axis
+    units), paired positionally with a same-length 'expr' (or 'descr')
+    array. Nested features are walked recursively.
+    """
+    units = {}
+
+    def visit(feat):
+        try:
+            names = {str(n) for n in feat.properties()}
+        except Exception:
+            names = set()
+
+        for prop in names:
+            if not prop.lower().endswith('unit'):
+                continue
+            try:
+                unit_type = str(feat.getValueType(prop))
+            except Exception:
+                continue
+
+            prefix = prop[:-len('unit')]
+            for label_prop in (prefix + 'descr', prefix + 'expr'):
+                if label_prop not in names:
+                    continue
+                try:
+                    if str(feat.getValueType(label_prop)) != unit_type:
+                        continue
+                    if unit_type == 'String':
+                        unit_val = str(feat.getString(prop)).strip()
+                        label_val = str(feat.getString(label_prop)).strip()
+                        if unit_val and label_val:
+                            units[label_val] = unit_val
+                            break
+                    elif unit_type == 'StringArray':
+                        unit_vals = [str(v).strip() for v in feat.getStringArray(prop)]
+                        label_vals = [str(v).strip() for v in feat.getStringArray(label_prop)]
+                        if len(unit_vals) == len(label_vals):
+                            for label_val, unit_val in zip(label_vals, unit_vals):
+                                if label_val and unit_val:
+                                    units[label_val] = unit_val
+                            break
+                except Exception:
+                    continue
+
+        try:
+            for ctag in feat.feature().tags():
+                visit(feat.feature(str(ctag)))
+        except Exception:
+            pass
+
+    try:
+        for ftag in pg.feature().tags():
+            visit(pg.feature(str(ftag)))
+    except Exception:
+        pass
+
+    return units
+
+
+# Spatial-coordinate column names COMSOL uses in plot exports (case-insensitive).
+COORDINATE_NAMES = {'r', 'x', 'y', 'z', 'phi'}
+
+
+def get_geometry_length_unit(model, pg) -> str:
+    """Return the length unit of the geometry behind a plot group's dataset.
+
+    Spatial-coordinate columns (R, Z, X, Y, ...) in COMSOL's plot exports are
+    given in the model geometry's length unit (e.g. 'µm'), but - unlike
+    expression columns - this isn't recorded as a feature property, so it
+    has to be looked up via the plot group's dataset.
+    """
+    try:
+        ds_tag = str(pg.getString('data'))
+        ds = model.java.result().dataset(ds_tag)
+        geom_tag = str(ds.getString('geom'))
+        return str(model.java.geom(geom_tag).lengthUnit())
+    except Exception:
+        return ''
+
+
+def parse_comsol_export(path: Path, units_map: dict[str, str] | None = None,
+                         coordinate_unit: str = '') -> tuple[pd.DataFrame, list[str]] | None:
     """Parse a COMSOL text export into (DataFrame, metadata comment lines).
 
     COMSOL prefixes the file with '%' lines holding metadata (Model, Version,
@@ -237,8 +348,14 @@ def parse_comsol_export(path: Path) -> tuple[pd.DataFrame, list[str]] | None:
     headers, with each header (e.g. 'Total displacement (m)') separated from
     the next by a run of 2+ spaces, while the unit's parentheses use single
     spaces - so splitting on '\\s{2,}' recovers the per-column labels.
+
+    Some columns get their unit from a separate plot-feature property rather
+    than from '(unit)' in the header text (see get_feature_units); units_map
+    fills those in by matching the column's name. Spatial-coordinate columns
+    (see COORDINATE_NAMES) fall back to coordinate_unit (see
+    get_geometry_length_unit), since they carry no feature property at all.
     """
-    text = path.read_text(encoding='utf-8', errors='replace')
+    text = repair_mojibake(path.read_text(encoding='utf-8', errors='replace'))
     comment_lines = [line[1:].strip() for line in text.splitlines() if line.startswith('%')]
 
     try:
@@ -257,6 +374,16 @@ def parse_comsol_export(path: Path) -> tuple[pd.DataFrame, list[str]] | None:
             meta = comment_lines[:-1]
 
     if headers:
+        if units_map or coordinate_unit:
+            merged = []
+            for header in headers:
+                name, unit = split_label_unit(header)
+                if not unit and units_map:
+                    unit = units_map.get(name, '')
+                if not unit and coordinate_unit and name.lower() in COORDINATE_NAMES:
+                    unit = coordinate_unit
+                merged.append(f"{name} ({unit})" if unit else name)
+            headers = merged
         df.columns = headers
     else:
         ncols = len(df.columns)
@@ -272,14 +399,14 @@ def parse_comsol_export(path: Path) -> tuple[pd.DataFrame, list[str]] | None:
     return df, meta
 
 
-def extract_via_export(model, pg_tag: str, output_dir: Path) -> tuple[pd.DataFrame, list[str]] | None:
+def extract_via_export(model, pg, pg_tag: str, output_dir: Path) -> tuple[pd.DataFrame, list[str]] | None:
     """Extract a plot group's data via COMSOL's native text export into a DataFrame."""
     export_path = export_via_comsol(model, pg_tag, output_dir)
     if export_path is None:
         return None
 
     try:
-        return parse_comsol_export(export_path)
+        return parse_comsol_export(export_path, get_feature_units(pg), get_geometry_length_unit(model, pg))
     except Exception as e:
         print(f"  [!] Could not parse export for '{pg_tag}': {e}")
         return None
@@ -323,16 +450,12 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = ''):
             sheet.cols_axis('xy', repeat=True)
 
         # Carry column names and units (parsed from 'Name (unit)' headers)
-        # over to Origin's long name / units row.
+        # over to Origin's long name / units label rows.
         for i, col in enumerate(df.columns):
             label, unit = split_label_unit(col)
-            try:
-                c = sheet.cols(i)
-                c.lname = label
-                if unit:
-                    c.units = unit
-            except Exception:
-                pass
+            sheet.set_label(i, label, type='L')
+            if unit:
+                sheet.set_label(i, unit, type='U')
 
         if comments:
             try:
@@ -505,7 +628,7 @@ def main():
         ptype = get_plot_type(pg)
         print(f"\n  [{ptype.upper():>7}] {tag} ({label})  [{class_name}]")
 
-        result = extract_via_export(model, tag, output_dir)
+        result = extract_via_export(model, pg, tag, output_dir)
         if result is not None and not result[0].empty:
             df, comments = result
 
