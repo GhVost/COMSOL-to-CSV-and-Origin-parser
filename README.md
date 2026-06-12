@@ -32,11 +32,12 @@ OriginLab** - and to check their availability interactively:
 
 - **OriginLab**'s LED shows green/grey depending on whether an
   Origin/OriginPro process is currently running.
-- **COMSOL**'s LED instead reflects a real availability check: the dialog
-  tries to start a COMSOL server (`mph.start()`) in the background as soon
-  as it opens, showing "checking server availability...", then green/"server
-  available" or red/"unavailable: ..." once it completes. The "OK" button is
-  disabled until this finishes.
+- **COMSOL**'s LED instead reflects a real availability check: as soon as
+  the dialog renders showing "checking server availability...", it tries to
+  start a COMSOL server (`mph.start()`), then updates to green/"server
+  available" or red/"unavailable: ...". This briefly blocks the window (the
+  "OK" button is disabled until it finishes), since starting COMSOL's JVM
+  must happen on the main thread.
 - If that check succeeds and **Extract from COMSOL** stays checked, the
   already-started server is reused for extraction - no second server is
   launched. If COMSOL is unchecked (or the dialog is cancelled), that test

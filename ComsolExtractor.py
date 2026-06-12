@@ -54,7 +54,6 @@ import csv
 import json
 import shutil
 import tempfile
-import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -901,11 +900,12 @@ def pick_mode_dialog() -> dict | None:
     - Each option has a status LED. OriginLab's LED reflects whether an
       Origin/OriginPro process is currently running (cheap process check).
     - COMSOL's LED instead reflects an actual attempt to start a COMSOL
-      server in the background (mph.start()) - a real availability check
-      (server reachable, license seat free), not just "is comsol.exe
-      running". The LED shows grey/"checking..." while this is in
-      progress, then green/"server available" or red/"unavailable: ..."
-      once it completes.
+      server (mph.start()) - a real availability check (server reachable,
+      license seat free), not just "is comsol.exe running". This runs once
+      the window has rendered its "checking..." status, then updates to
+      green/"server available" or red/"unavailable: ...". JPype's JVM must
+      be started on the main thread, so this check briefly blocks the
+      window rather than running in a background thread.
     - If that COMSOL server check succeeds and the user keeps "Extract
       from COMSOL" ticked, the already-started client is handed back and
       reused for extraction (no second server is started). If COMSOL isn't
@@ -936,9 +936,7 @@ def pick_mode_dialog() -> dict | None:
     comsol_var = tk.BooleanVar(value=True)
     origin_var = tk.BooleanVar(value=origin_already_running())
 
-    # Shared state updated by the background COMSOL-check thread and read
-    # back on the GUI thread via root.after() polling (tkinter widgets must
-    # only be touched from the main thread).
+    # Filled in by run_comsol_check() below.
     state = {'comsol_status': 'checking', 'comsol_client': None, 'comsol_error': None}
 
     leds = {}
@@ -973,43 +971,38 @@ def pick_mode_dialog() -> dict | None:
 
     result = {'mode': None}
 
-    # -- Background check: actually start a COMSOL server --
+    # -- Real availability check: actually start a COMSOL server --
     # This is a real availability check (license seat, server reachable),
     # not just a process-name scan. If it succeeds and the user keeps
     # COMSOL selected, the started client is reused for extraction.
-    def check_comsol():
+    # JPype's JVM has thread affinity, so this must run on the main thread -
+    # it briefly blocks the window after it renders its "checking..." state.
+    def run_comsol_check():
         try:
             client = mph.start()
-            if state.get('cancelled'):
-                # The dialog was already closed before this finished - don't
-                # leave the test session running.
-                try:
-                    client.clear()
-                except Exception:
-                    pass
-                return
             state['comsol_client'] = client
             state['comsol_status'] = 'available'
         except Exception as e:
             state['comsol_status'] = 'unavailable'
             state['comsol_error'] = str(e)
 
-    threading.Thread(target=check_comsol, daemon=True).start()
+    # Recorded before run_comsol_check() so the warning below can tell
+    # whether the availability check itself used an extra instance/seat.
+    comsol_was_running = comsol_already_running()
 
     def update_warning():
         msgs = []
-        if comsol_var.get() and comsol_already_running() and state['comsol_status'] == 'checking':
-            msgs.append("A COMSOL process is already running - the server "
-                         "availability check may use an additional license seat.")
+        if comsol_var.get() and comsol_was_running:
+            msgs.append("A COMSOL process was already running - the "
+                         "availability check used an additional engine "
+                         "instance and license seat.")
         if origin_var.get() and not origin_already_running():
             msgs.append("OriginLab does not appear to be running - originpro "
                          "will try to launch it automatically.")
         warn_label.configure(text='\n'.join(msgs))
 
-    def poll():
-        if state['comsol_status'] == 'checking':
-            status_labels['comsol'].configure(text='checking server availability...')
-        elif state['comsol_status'] == 'available':
+    def refresh_comsol_status():
+        if state['comsol_status'] == 'available':
             leds['comsol'][0].itemconfig(leds['comsol'][1], fill='#2ecc40')
             status_labels['comsol'].configure(text='server available')
         else:
@@ -1020,16 +1013,11 @@ def pick_mode_dialog() -> dict | None:
             status_labels['comsol'].configure(text=f'unavailable: {err}')
 
         update_warning()
-
-        if state['comsol_status'] == 'checking':
-            hint.configure(text="Checking COMSOL server availability...")
-            root.after(300, poll)
-        else:
-            hint.configure(text="Select at least one option.", foreground='#888888')
-            ok_btn.configure(state='normal')
+        hint.configure(text="Select at least one option.", foreground='#888888')
+        ok_btn.configure(state='normal')
 
     def discard_comsol_client():
-        # If the background check started a COMSOL server but it ends up
+        # If the availability check started a COMSOL server but it ends up
         # unused (COMSOL not selected, or the dialog is cancelled), shut it
         # down again rather than leaving an orphaned session running.
         client = state.get('comsol_client')
@@ -1055,9 +1043,6 @@ def pick_mode_dialog() -> dict | None:
         root.destroy()
 
     def on_cancel():
-        # Tell a still-running background check to clean up after itself
-        # once it finishes, since this dialog won't be around to do it.
-        state['cancelled'] = True
         discard_comsol_client()
         result['mode'] = None
         root.destroy()
@@ -1069,7 +1054,14 @@ def pick_mode_dialog() -> dict | None:
     ok_btn.pack(side='right', padx=(0, 5))
 
     root.protocol('WM_DELETE_WINDOW', on_cancel)
-    poll()
+
+    # Render the "checking server availability..." state before running the
+    # (blocking) COMSOL availability check, so the user sees it immediately.
+    root.update_idletasks()
+    root.update()
+    run_comsol_check()
+    refresh_comsol_status()
+
     root.mainloop()
     return result['mode']
 
