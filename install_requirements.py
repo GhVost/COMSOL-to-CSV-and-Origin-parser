@@ -1,5 +1,5 @@
 """
-Install the Python packages required by ComsolExtractor.py.
+Install the Python packages required by COMSOLExtractor.py.
 
 Usage:
     python install_requirements.py

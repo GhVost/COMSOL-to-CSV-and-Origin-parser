@@ -1,12 +1,12 @@
 """
-Build a standalone ComsolExtractor.exe with PyInstaller.
+Build a standalone COMSOLExtractor.exe with PyInstaller.
 
 Usage:
     .venv\\Scripts\\python build_exe.py
 
 Requires the packages in requirements.txt plus 'pyinstaller' to be
 installed in the active environment (e.g. `pip install pyinstaller`).
-Output is written to dist/ComsolExtractor.exe.
+Output is written to dist/COMSOLExtractor.exe.
 
 COMSOL Multiphysics and/or OriginLab must still be installed and licensed
 on the machine running the resulting .exe - this only bundles the Python
@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-SPEC_FILE = Path(__file__).resolve().parent / 'ComsolExtractor.spec'
+SPEC_FILE = Path(__file__).resolve().parent / 'COMSOLExtractor.spec'
 
 
 def main():
@@ -34,7 +34,7 @@ def main():
     if result.returncode != 0:
         sys.exit(result.returncode)
 
-    print("\nBuilt dist/ComsolExtractor.exe")
+    print("\nBuilt dist/COMSOLExtractor.exe")
 
 
 if __name__ == '__main__':

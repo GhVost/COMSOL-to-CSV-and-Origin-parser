@@ -9,5 +9,5 @@ psutil
 originpro
 
 # Optional - only needed to build a standalone .exe with build_exe.py /
-# ComsolExtractor.spec.
+# COMSOLExtractor.spec.
 pyinstaller

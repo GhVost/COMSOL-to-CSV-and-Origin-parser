@@ -22,7 +22,7 @@ Requirements:
     - pip install originpro and OriginLab installed (only for --origin)
 
 Usage:
-    python ComsolExtractor.py --origin
+    python COMSOLExtractor.py --origin
 
 Opens a file dialog to pick the .mph model, then a checklist window listing
 every table and plot group found in the model - pick which ones to extract,
@@ -47,7 +47,7 @@ Module layout (in order):
                             everything together and writes manifest.json.
 """
 
-__version__ = '1.2.0'
+__version__ = '1.3.0'
 
 import argparse
 import os
@@ -57,6 +57,7 @@ import csv
 import json
 import shutil
 import tempfile
+import traceback
 from pathlib import Path
 from datetime import datetime
 
@@ -266,6 +267,14 @@ def confirm_or_exit(message: str):
         input("Press Enter to continue, or Ctrl+C to abort... ")
     except KeyboardInterrupt:
         sys.exit("\nAborted by user.")
+
+
+def pause_if_frozen():
+    """When running as a bundled .exe (no console window of its own), wait
+    for Enter before the window closes so any final messages - including
+    OriginLab push errors - stay visible."""
+    if getattr(sys, 'frozen', False):
+        input("\nPress Enter to exit... ")
 
 
 def get_plot_type(java_plot) -> str:
@@ -786,66 +795,74 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = ''):
         print("No data to import into Origin.")
         return
 
-    for entry in datasets:
-        name, kind, df = entry['name'], entry['kind'], entry['df']
-        comments = entry.get('comments') or []
-
-        # Multiple curves sharing one x-axis come back as long-format (x, y, group);
-        # pivot to wide format (one y column per group) for proper multi-curve plotting.
-        if 'group' in df.columns and {'x', 'y'}.issubset(df.columns):
-            df = df.pivot_table(index='x', columns='group', values='y', sort=False).reset_index()
-            df.columns = ['x'] + [str(c) for c in df.columns[1:]]
-
-        # Create one new worksheet per extracted table/plot, named after
-        # the COMSOL tag+label, and load the DataFrame into it.
-        wb = op.new_book('w', name)
-        sheet = wb[0]
-        sheet.from_df(df)
-        if len(df.columns) >= 2:
-            # Mark the first column as X and the rest as Y, repeating the
-            # X/Y pattern for any extra column groups.
-            sheet.cols_axis('xy', repeat=True)
-
-        # Carry column names and units (parsed from 'Name (unit)' headers)
-        # over to Origin's long name / units label rows.
-        for i, col in enumerate(df.columns):
-            label, unit = split_label_unit(col)
-            sheet.set_label(i, label, type='L')
-            if unit:
-                sheet.set_label(i, unit, type='U')
-
-        # Carry over any COMSOL metadata/user comments as the sheet's
-        # comments field, if Origin's API allows setting it.
-        if comments:
-            try:
-                sheet.comments = '\n'.join(comments)
-            except Exception:
-                pass
-
-        # For tables and 1D plots, also create a line graph plotting every
-        # Y column against the first (X) column.
-        if kind in ('table', '1d') and len(df.columns) >= 2:
-            graph = op.new_graph(template=template) if template else op.new_graph()
-            layer = graph[0]
-            for i in range(1, len(df.columns)):
-                layer.add_plot(sheet, coly=i, colx=0)
-            layer.rescale()
-            graph.lname = name
-
-        print(f"  -> Imported: {name}")
-
-    # Save everything as a single .opju project file in the output folder.
-    opju_path = output_dir / 'comsol_results.opju'
-    op.save(str(opju_path))
-    print(f"\nOrigin project saved: {opju_path}")
-
-    # Detach originpro from this Origin instance. If originpro launched its
-    # own hidden Origin process, op.exit() asks it to shut down; if it
-    # attached to an Origin the user already had open, this is a no-op.
     try:
-        op.exit()
+        for entry in datasets:
+            name, kind, df = entry['name'], entry['kind'], entry['df']
+            comments = entry.get('comments') or []
+
+            # Multiple curves sharing one x-axis come back as long-format (x, y, group);
+            # pivot to wide format (one y column per group) for proper multi-curve plotting.
+            if 'group' in df.columns and {'x', 'y'}.issubset(df.columns):
+                df = df.pivot_table(index='x', columns='group', values='y', sort=False).reset_index()
+                df.columns = ['x'] + [str(c) for c in df.columns[1:]]
+
+            # Create one new worksheet per extracted table/plot, named after
+            # the COMSOL tag+label, and load the DataFrame into it.
+            wb = op.new_book('w', name)
+            sheet = wb[0]
+            sheet.from_df(df)
+            if len(df.columns) >= 2:
+                # Mark the first column as X and the rest as Y, repeating the
+                # X/Y pattern for any extra column groups.
+                sheet.cols_axis('xy', repeat=True)
+
+            # Carry column names and units (parsed from 'Name (unit)' headers)
+            # over to Origin's long name / units label rows.
+            for i, col in enumerate(df.columns):
+                label, unit = split_label_unit(col)
+                sheet.set_label(i, label, type='L')
+                if unit:
+                    sheet.set_label(i, unit, type='U')
+
+            # Carry over any COMSOL metadata/user comments as the sheet's
+            # comments field, if Origin's API allows setting it.
+            if comments:
+                try:
+                    sheet.comments = '\n'.join(comments)
+                except Exception:
+                    pass
+
+            # For tables and 1D plots, also create a line graph plotting every
+            # Y column against the first (X) column.
+            if kind in ('table', '1d') and len(df.columns) >= 2:
+                graph = op.new_graph(template=template) if template else op.new_graph()
+                layer = graph[0]
+                for i in range(1, len(df.columns)):
+                    layer.add_plot(sheet, coly=i, colx=0)
+                layer.rescale()
+                graph.lname = name
+
+            print(f"  -> Imported: {name}")
+
+        # Save everything as a single .opju project file in the output folder.
+        opju_path = output_dir / 'comsol_results.opju'
+        op.save(str(opju_path))
+        print(f"\nOrigin project saved: {opju_path}")
     except Exception:
-        pass
+        # Don't let a COM/Origin-side failure (e.g. Origin couldn't be
+        # launched/attached to) take down the whole script after extraction
+        # has already succeeded - report it and let the caller continue.
+        print("\n[!] Failed to push results to OriginLab:")
+        traceback.print_exc()
+    finally:
+        # Detach originpro from this Origin instance. If originpro launched
+        # its own hidden Origin process, op.exit() asks it to shut down; if
+        # it attached to an Origin the user already had open, this is a
+        # no-op.
+        try:
+            op.exit()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1235,6 +1252,7 @@ def main():
 
         os.startfile(folder)  # open the results folder in File Explorer
         print("Done.")
+        pause_if_frozen()
         return
 
     # -- Resolve model path: CLI arg or file dialog --
@@ -1455,6 +1473,7 @@ def main():
     os.startfile(output_dir)  # open the results folder in File Explorer
     client.clear()
     print("Done.")
+    pause_if_frozen()
 
 
 if __name__ == '__main__':

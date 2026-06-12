@@ -27,7 +27,7 @@ also be run directly with `pip install -r requirements.txt` if preferred.
 ## Usage
 
 ```powershell
-.venv\Scripts\python.exe ComsolExtractor.py
+.venv\Scripts\python.exe COMSOLExtractor.py
 ```
 
 With no `--comsol`/`--origin` flags, a single combined dialog appears to
@@ -65,7 +65,7 @@ The same choices are available non-interactively via `--comsol` and
 the dialog is skipped.
 
 ```powershell
-.venv\Scripts\python.exe ComsolExtractor.py --comsol --origin
+.venv\Scripts\python.exe COMSOLExtractor.py --comsol --origin
 ```
 
 This opens a file picker to choose the `.mph` model, extracts everything,
@@ -85,7 +85,7 @@ are already running and prompts if action may be needed:
 
 Other options:
 
-- `ComsolExtractor.py model.mph --comsol` — extract a specific model (skips
+- `COMSOLExtractor.py model.mph --comsol` — extract a specific model (skips
   the file dialog)
 - `--output ./out` — custom output directory (COMSOL mode)
 - `--origin-template my_template.otpu` — Origin graph template for line plots
@@ -93,7 +93,7 @@ Other options:
 
 ## Building a standalone executable
 
-A single-file `ComsolExtractor.exe` can be built with
+A single-file `COMSOLExtractor.exe` can be built with
 [PyInstaller](https://pyinstaller.org/), so it can run without a Python
 install (COMSOL Multiphysics and/or OriginLab are still required separately
 - see Disclaimer).
@@ -103,9 +103,9 @@ install (COMSOL Multiphysics and/or OriginLab are still required separately
 .venv\Scripts\python build_exe.py
 ```
 
-This runs PyInstaller against `ComsolExtractor.spec` and writes
-`dist\ComsolExtractor.exe`. The version shown in its file properties
-(and by `--version`) comes from `__version__` in `ComsolExtractor.py` and
+This runs PyInstaller against `COMSOLExtractor.spec` and writes
+`dist\COMSOLExtractor.exe`. The version shown in its file properties
+(and by `--version`) comes from `__version__` in `COMSOLExtractor.py` and
 `version_info.txt` - keep both in sync when bumping the version.
 
 ## Output

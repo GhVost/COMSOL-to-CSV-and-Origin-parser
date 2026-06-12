@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 #
 # PyInstaller spec for a single-file Windows executable. Build with:
-#   .venv\Scripts\pyinstaller ComsolExtractor.spec
+#   .venv\Scripts\pyinstaller COMSOLExtractor.spec
 #
 # COMSOL Multiphysics and/or OriginLab must still be installed and licensed
 # on the machine running the resulting .exe - this only bundles the Python
@@ -13,7 +13,7 @@ import mph
 mph_dir = Path(mph.__file__).parent
 
 a = Analysis(
-    ['ComsolExtractor.py'],
+    ['COMSOLExtractor.py'],
     pathex=[],
     binaries=[],
     # mph reads its COMSOL feature/tag lookup table from this JSON file at
@@ -34,7 +34,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='ComsolExtractor',
+    name='COMSOLExtractor',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
