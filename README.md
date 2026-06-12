@@ -1,4 +1,4 @@
-# COMSOL-data-parser
+# COMSOL to .csv and/or Origin parser
 
 Extract result tables and plot groups (1D/2D/3D) from a COMSOL `.mph` model
 and save them as CSV files, optionally importing everything directly into an
