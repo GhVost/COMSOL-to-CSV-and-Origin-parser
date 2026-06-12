@@ -739,15 +739,66 @@ ITEM_GROUP_LABELS = {
 }
 
 
-def pick_extraction_dialog(items: list[dict], model_name: str, comsol_warning: str | None,
-                            push_to_origin_default: bool) -> dict | None:
-    """Combined window: COMSOL/OriginLab status (with a "Start OriginPro"
-    button) and the checklist of tables/plot groups to extract, grouped by type.
+def discover_items(model) -> list[dict]:
+    """Discover extractable result tables and plot groups in a loaded model.
 
-    Every item is checked by default. Returns
-    {'items': [...selected items...], 'push_to_origin': bool}, or None if the
-    user cancelled (closed the window or clicked Cancel).
+    Returns a flat list of dicts tagged with 'kind' (table/1d/2d/3d/unknown)
+    for grouping in the checklist and for picking the right extraction
+    routine later.
     """
+    java_result = model.java.result()
+
+    try:
+        tbl_tags = [str(t) for t in java_result.table().tags()]
+    except Exception as e:
+        print(f"  [!] Could not list result tables: {e}")
+        tbl_tags = []
+
+    # Top-level result node tags - includes plot groups ('pg1', 'pg2', ...)
+    # as well as other result-tree entries.
+    try:
+        pg_tags = [str(t) for t in java_result.tags()]
+    except Exception as e:
+        print(f"  [!] Could not list plot groups: {e}")
+        pg_tags = []
+
+    items = []
+    for tag in tbl_tags:
+        try:
+            label = str(java_result.table(tag).label())
+        except Exception:
+            label = tag
+        items.append({'tag': tag, 'label': label, 'kind': 'table'})
+
+    for tag in pg_tags:
+        try:
+            pg = model.java.result(tag)
+            label = str(pg.label()) if hasattr(pg, 'label') else tag
+            class_name = str(pg.getClass().getSimpleName())
+        except Exception as e:
+            print(f"  [!] Could not access plot group '{tag}': {e}")
+            continue
+        items.append({'tag': tag, 'label': label, 'kind': get_plot_type(pg),
+                       'class_name': class_name, 'pg': pg})
+
+    return items
+
+
+def run_extraction_window(model_path: Path, comsol_warning: str | None,
+                           push_to_origin_default: bool) -> dict | None:
+    """Open the combined status/items window immediately, starting COMSOL and
+    loading the model in a background thread while the window is shown.
+
+    A status bar reports progress ("Starting COMSOL server...", "Loading
+    model...", ...). Once the model is loaded, the items checklist is
+    populated and Extract/Select All/Deselect All become available.
+
+    Returns {'client': ..., 'model': ..., 'items': [...selected items...],
+    'push_to_origin': bool}, or None if cancelled (closed the window or
+    clicked Cancel, before or after loading).
+    """
+    import queue
+    import threading
     import tkinter as tk
     from tkinter import ttk
 
@@ -766,9 +817,10 @@ def pick_extraction_dialog(items: list[dict], model_name: str, comsol_warning: s
     comsol_row = ttk.Frame(status)
     comsol_row.pack(fill='x')
     comsol_led = tk.Canvas(comsol_row, width=14, height=14, highlightthickness=0)
-    comsol_led.create_oval(2, 2, 12, 12, fill='#2ecc40', outline='')
+    comsol_oval = comsol_led.create_oval(2, 2, 12, 12, fill='#b0b0b0', outline='')
     comsol_led.pack(side='left', padx=(0, 6))
-    ttk.Label(comsol_row, text=f"COMSOL: model '{model_name}' loaded").pack(side='left')
+    comsol_label = ttk.Label(comsol_row, text="COMSOL: starting...")
+    comsol_label.pack(side='left')
 
     if comsol_warning:
         ttk.Label(status, text=comsol_warning, foreground='#cc6600',
@@ -838,21 +890,33 @@ def pick_extraction_dialog(items: list[dict], model_name: str, comsol_warning: s
     canvas.pack(side='left', fill='both', expand=True)
     scrollbar.pack(side='right', fill='y')
 
-    # One checkbox per item, grouped under bold headings by kind; a new
-    # heading is only inserted when the group changes.
+    loading_label = ttk.Label(inner, text="Waiting for COMSOL to load the model...")
+    loading_label.pack(anchor='w', pady=10)
+
+    # -- Status bar --
+    status_bar = ttk.Label(container, text="Starting COMSOL server...", anchor='w',
+                            relief='sunken', padding=(4, 2))
+    status_bar.pack(fill='x', pady=(8, 0))
+
     variables = []
-    last_group = None
-    for item in items:
-        group = item['kind'] if item['kind'] in ITEM_GROUP_LABELS else 'other'
-        if group != last_group:
-            ttk.Label(inner, text=ITEM_GROUP_LABELS.get(group, 'Other'),
-                      font=('TkDefaultFont', 9, 'bold')).pack(
-                anchor='w', pady=(8 if last_group else 0, 2))
-            last_group = group
-        var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(inner, text=f"{item['tag']}: {item['label']}", variable=var).pack(
-            anchor='w', padx=(10, 0))
-        variables.append(var)
+    state = {'client': None, 'model': None, 'items': []}
+
+    def populate_items(items):
+        # One checkbox per item, grouped under bold headings by kind; a new
+        # heading is only inserted when the group changes.
+        loading_label.destroy()
+        last_group = None
+        for item in items:
+            group = item['kind'] if item['kind'] in ITEM_GROUP_LABELS else 'other'
+            if group != last_group:
+                ttk.Label(inner, text=ITEM_GROUP_LABELS.get(group, 'Other'),
+                          font=('TkDefaultFont', 9, 'bold')).pack(
+                    anchor='w', pady=(8 if last_group else 0, 2))
+                last_group = group
+            var = tk.BooleanVar(value=True)
+            ttk.Checkbutton(inner, text=f"{item['tag']}: {item['label']}", variable=var).pack(
+                anchor='w', padx=(10, 0))
+            variables.append(var)
 
     result = {'items': None, 'push_to_origin': False}
 
@@ -865,7 +929,7 @@ def pick_extraction_dialog(items: list[dict], model_name: str, comsol_warning: s
             v.set(False)
 
     def on_extract():
-        result['items'] = [item for item, v in zip(items, variables) if v.get()]
+        result['items'] = [item for item, v in zip(state['items'], variables) if v.get()]
         result['push_to_origin'] = push_var.get()
         root.destroy()
 
@@ -875,14 +939,71 @@ def pick_extraction_dialog(items: list[dict], model_name: str, comsol_warning: s
 
     btn_frame = ttk.Frame(container)
     btn_frame.pack(fill='x', pady=(10, 0))
-    ttk.Button(btn_frame, text="Select All", command=select_all).pack(side='left')
-    ttk.Button(btn_frame, text="Deselect All", command=deselect_all).pack(side='left', padx=5)
+    select_all_btn = ttk.Button(btn_frame, text="Select All", command=select_all, state='disabled')
+    deselect_all_btn = ttk.Button(btn_frame, text="Deselect All", command=deselect_all, state='disabled')
+    select_all_btn.pack(side='left')
+    deselect_all_btn.pack(side='left', padx=5)
     ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side='right')
-    ttk.Button(btn_frame, text="Extract", command=on_extract).pack(side='right', padx=5)
+    extract_btn = ttk.Button(btn_frame, text="Extract", command=on_extract, state='disabled')
+    extract_btn.pack(side='right', padx=5)
+
+    # -- Start COMSOL, load the model, and discover items in the background --
+    msg_queue = queue.Queue()
+
+    def worker():
+        try:
+            msg_queue.put(('status', "Starting COMSOL server..."))
+            client = mph.start()
+            msg_queue.put(('status', f"Loading model: {model_path.name}"))
+            model = client.load(str(model_path))
+            msg_queue.put(('status', "Discovering extractable items..."))
+            items = discover_items(model)
+            msg_queue.put(('ready', client, model, items))
+        except Exception as e:
+            msg_queue.put(('error', str(e)))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def poll_worker():
+        try:
+            while True:
+                msg = msg_queue.get_nowait()
+                if msg[0] == 'status':
+                    status_bar.configure(text=msg[1])
+                elif msg[0] == 'ready':
+                    _, client, model, items = msg
+                    state['client'], state['model'], state['items'] = client, model, items
+                    comsol_led.itemconfig(comsol_oval, fill='#2ecc40')
+                    comsol_label.configure(text=f"COMSOL: model '{model_path.name}' loaded")
+                    if items:
+                        populate_items(items)
+                        status_bar.configure(text=f"Found {len(items)} extractable item(s). Ready.")
+                        for b in (select_all_btn, deselect_all_btn, extract_btn):
+                            b.configure(state='normal')
+                    else:
+                        status_bar.configure(text="No extractable tables or plot groups found in this model.")
+                    return
+                elif msg[0] == 'error':
+                    comsol_led.itemconfig(comsol_oval, fill='#ff4136')
+                    comsol_label.configure(text="COMSOL: failed to start")
+                    status_bar.configure(text=f"Error: {msg[1]}")
+                    print(f"\n[!] {msg[1]}")
+                    return
+        except queue.Empty:
+            pass
+        root.after(150, poll_worker)
+
+    root.after(150, poll_worker)
 
     root.protocol('WM_DELETE_WINDOW', on_cancel)
     root.mainloop()
-    return result if result['items'] is not None else None
+
+    if result['items'] is None:
+        if state['client'] is not None:
+            state['client'].clear()
+        return None
+    return {'client': state['client'], 'model': state['model'],
+            'items': result['items'], 'push_to_origin': result['push_to_origin']}
 
 
 def main():
@@ -974,12 +1095,18 @@ def main():
             "separate license seat."
         )
 
-    # -- Start COMSOL server and load model --
-    print("Starting COMSOL server...")
-    client = mph.start()
-    print(f"Loading model: {model_path.name}")
-    model = client.load(str(model_path))
-    print(f"Model loaded.\n")
+    # -- Combined status + item-selection window, shown immediately --
+    choice = run_extraction_window(model_path, comsol_warning, do_origin)
+    if choice is None:
+        print("Nothing selected. Exiting.")
+        return
+    client, model = choice['client'], choice['model']
+    if not choice['items']:
+        print("Nothing selected. Exiting.")
+        client.clear()
+        return
+    selected = choice['items']
+    do_origin = choice['push_to_origin']
 
     # Top-level summary written to manifest.json at the end. Each list holds
     # one dict per successfully extracted item (tag, label, output filename,
@@ -994,59 +1121,6 @@ def main():
         'other': [],
     }
     datasets = []  # collected for direct OriginLab export: {'name', 'kind', 'df'}
-
-    # -- Discover result nodes --
-    java_result = model.java.result()
-
-    try:
-        tbl_tags = [str(t) for t in java_result.table().tags()]
-    except Exception as e:
-        print(f"  [!] Could not list result tables: {e}")
-        tbl_tags = []
-
-    # Top-level result node tags - includes plot groups ('pg1', 'pg2', ...)
-    # as well as other result-tree entries.
-    try:
-        pg_tags = [str(t) for t in java_result.tags()]
-    except Exception as e:
-        print(f"  [!] Could not list plot groups: {e}")
-        pg_tags = []
-
-    # Flat list of everything the user can choose to extract, tagged with its
-    # 'kind' (table/1d/2d/3d/unknown) for grouping in the checklist and for
-    # picking the right extraction routine later.
-    items = []
-    for tag in tbl_tags:
-        try:
-            label = str(java_result.table(tag).label())
-        except Exception:
-            label = tag
-        items.append({'tag': tag, 'label': label, 'kind': 'table'})
-
-    for tag in pg_tags:
-        try:
-            pg = model.java.result(tag)
-            label = str(pg.label()) if hasattr(pg, 'label') else tag
-            class_name = str(pg.getClass().getSimpleName())
-        except Exception as e:
-            print(f"  [!] Could not access plot group '{tag}': {e}")
-            continue
-        items.append({'tag': tag, 'label': label, 'kind': get_plot_type(pg),
-                       'class_name': class_name, 'pg': pg})
-
-    if not items:
-        client.clear()
-        sys.exit("No extractable tables or plot groups found in this model.")
-
-    # -- Combined status + item-selection window --
-    print(f"Found {len(items)} extractable item(s). Opening selection window...")
-    choice = pick_extraction_dialog(items, model_path.name, comsol_warning, do_origin)
-    if choice is None or not choice['items']:
-        print("Nothing selected. Exiting.")
-        client.clear()
-        return
-    selected = choice['items']
-    do_origin = choice['push_to_origin']
 
     # ---- Extract selected items ----
     output_dir.mkdir(parents=True, exist_ok=True)
