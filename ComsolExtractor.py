@@ -54,6 +54,7 @@ import csv
 import json
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -218,6 +219,39 @@ def origin_already_running() -> bool:
         if name.startswith('origin'):
             return True
     return False
+
+
+def get_origin_pids() -> set[int]:
+    """Return the PIDs of all currently running Origin/OriginPro processes."""
+    if psutil is None:
+        return set()
+    return {
+        proc.info['pid']
+        for proc in psutil.process_iter(['pid', 'name'])
+        if (proc.info.get('name') or '').lower().startswith('origin')
+    }
+
+
+def close_new_origin_processes(pids_before: set[int]):
+    """Terminate any Origin/OriginPro process that wasn't running before
+    push_to_origin() was called.
+
+    originpro launches its own hidden Origin instance via COM if one
+    wasn't already running, and op.exit() doesn't always fully tear that
+    instance down afterwards - leaving a process that keeps the .opju file
+    locked for further operations. Compare against pids_before (captured
+    before push_to_origin()) and only close processes that appeared since,
+    leaving any Origin session the user already had open untouched.
+    """
+    if psutil is None:
+        return
+    for proc in psutil.process_iter(['pid', 'name']):
+        name = (proc.info.get('name') or '').lower()
+        if name.startswith('origin') and proc.info['pid'] not in pids_before:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
 
 
 def confirm_or_exit(message: str):
@@ -803,6 +837,14 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = ''):
     op.save(str(opju_path))
     print(f"\nOrigin project saved: {opju_path}")
 
+    # Detach originpro from this Origin instance. If originpro launched its
+    # own hidden Origin process, op.exit() asks it to shut down; if it
+    # attached to an Origin the user already had open, this is a no-op.
+    try:
+        op.exit()
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -849,17 +891,32 @@ def pick_folder_dialog(title: str) -> Path | None:
 
 
 def pick_mode_dialog() -> dict | None:
-    """Show a small dialog to choose which steps to run: extracting from a
+    """Show a single dialog to choose which steps to run - extracting from a
     COMSOL model (--comsol) and/or importing results into OriginLab
-    (--origin), shown when neither option was given on the command line.
+    (--origin) - shown when neither option was given on the command line.
 
-    Each option has a status LED - green if a matching COMSOL/OriginLab
-    process is currently running, grey otherwise - so the user can decide
-    accordingly (e.g. pick Origin-only if COMSOL's license is busy
-    elsewhere, or COMSOL-only if OriginLab isn't installed on this machine).
+    This combines the old mode-picker window with the separate
+    console-based pre-flight checks into one interactive window:
 
-    Returns {'comsol': bool, 'origin': bool}, or None if the user cancelled.
-    At least one of the two must be selected to proceed.
+    - Each option has a status LED. OriginLab's LED reflects whether an
+      Origin/OriginPro process is currently running (cheap process check).
+    - COMSOL's LED instead reflects an actual attempt to start a COMSOL
+      server in the background (mph.start()) - a real availability check
+      (server reachable, license seat free), not just "is comsol.exe
+      running". The LED shows grey/"checking..." while this is in
+      progress, then green/"server available" or red/"unavailable: ..."
+      once it completes.
+    - If that COMSOL server check succeeds and the user keeps "Extract
+      from COMSOL" ticked, the already-started client is handed back and
+      reused for extraction (no second server is started). If COMSOL isn't
+      selected, the test client is shut down again before the dialog
+      closes.
+    - Any warnings that used to be separate confirm_or_exit() prompts (e.g.
+      "OriginLab isn't running yet") are shown inline here instead.
+
+    Returns {'comsol': bool, 'origin': bool, 'comsol_client': client|None},
+    or None if the user cancelled. At least one of the two must be selected
+    to proceed.
     """
     import tkinter as tk
     from tkinter import ttk
@@ -877,45 +934,142 @@ def pick_mode_dialog() -> dict | None:
         row=0, column=0, columnspan=3, sticky='w', pady=(0, 10))
 
     comsol_var = tk.BooleanVar(value=True)
-    origin_var = tk.BooleanVar(value=False)
+    origin_var = tk.BooleanVar(value=origin_already_running())
 
-    def add_row(row: int, text: str, var: tk.BooleanVar, running: bool):
+    # Shared state updated by the background COMSOL-check thread and read
+    # back on the GUI thread via root.after() polling (tkinter widgets must
+    # only be touched from the main thread).
+    state = {'comsol_status': 'checking', 'comsol_client': None, 'comsol_error': None}
+
+    leds = {}
+    status_labels = {}
+
+    def add_row(row: int, text: str, var: tk.BooleanVar, key: str, initial_text: str):
         ttk.Checkbutton(container, text=text, variable=var).grid(
             row=row, column=0, sticky='w', pady=3)
-        # A small filled circle: green when the process is running, grey
-        # when it isn't - the "LED" the user can check at a glance.
+        # A small filled circle, recoloured as each check completes.
         led = tk.Canvas(container, width=14, height=14, highlightthickness=0)
-        led.create_oval(2, 2, 12, 12, fill=('#2ecc40' if running else '#b0b0b0'), outline='')
+        oval = led.create_oval(2, 2, 12, 12, fill='#b0b0b0', outline='')
         led.grid(row=row, column=1, padx=(15, 5))
-        ttk.Label(container, text='running' if running else 'not running').grid(
-            row=row, column=2, sticky='w')
+        lbl = ttk.Label(container, text=initial_text)
+        lbl.grid(row=row, column=2, sticky='w')
+        leds[key] = (led, oval)
+        status_labels[key] = lbl
 
-    add_row(1, "Extract from COMSOL (--comsol)", comsol_var, comsol_already_running())
-    add_row(2, "Import into OriginLab (--origin)", origin_var, origin_already_running())
+    add_row(1, "Extract from COMSOL (--comsol)", comsol_var, 'comsol', 'checking server availability...')
+    add_row(2, "Import into OriginLab (--origin)", origin_var, 'origin',
+            'running' if origin_already_running() else 'not running')
+    # The OriginLab LED only reflects an instant process check, so set it now.
+    leds['origin'][0].itemconfig(
+        leds['origin'][1], fill=('#2ecc40' if origin_already_running() else '#b0b0b0'))
 
-    hint = ttk.Label(container, text="Select at least one option.", foreground='#888888')
-    hint.grid(row=3, column=0, columnspan=3, sticky='w', pady=(8, 0))
+    warn_label = ttk.Label(container, text="", foreground='#cc6600',
+                            wraplength=340, justify='left')
+    warn_label.grid(row=3, column=0, columnspan=3, sticky='w', pady=(8, 0))
+
+    hint = ttk.Label(container, text="Checking COMSOL server availability...",
+                      foreground='#888888')
+    hint.grid(row=4, column=0, columnspan=3, sticky='w', pady=(4, 0))
 
     result = {'mode': None}
+
+    # -- Background check: actually start a COMSOL server --
+    # This is a real availability check (license seat, server reachable),
+    # not just a process-name scan. If it succeeds and the user keeps
+    # COMSOL selected, the started client is reused for extraction.
+    def check_comsol():
+        try:
+            client = mph.start()
+            if state.get('cancelled'):
+                # The dialog was already closed before this finished - don't
+                # leave the test session running.
+                try:
+                    client.clear()
+                except Exception:
+                    pass
+                return
+            state['comsol_client'] = client
+            state['comsol_status'] = 'available'
+        except Exception as e:
+            state['comsol_status'] = 'unavailable'
+            state['comsol_error'] = str(e)
+
+    threading.Thread(target=check_comsol, daemon=True).start()
+
+    def update_warning():
+        msgs = []
+        if comsol_var.get() and comsol_already_running() and state['comsol_status'] == 'checking':
+            msgs.append("A COMSOL process is already running - the server "
+                         "availability check may use an additional license seat.")
+        if origin_var.get() and not origin_already_running():
+            msgs.append("OriginLab does not appear to be running - originpro "
+                         "will try to launch it automatically.")
+        warn_label.configure(text='\n'.join(msgs))
+
+    def poll():
+        if state['comsol_status'] == 'checking':
+            status_labels['comsol'].configure(text='checking server availability...')
+        elif state['comsol_status'] == 'available':
+            leds['comsol'][0].itemconfig(leds['comsol'][1], fill='#2ecc40')
+            status_labels['comsol'].configure(text='server available')
+        else:
+            leds['comsol'][0].itemconfig(leds['comsol'][1], fill='#cc4040')
+            err = (state['comsol_error'] or 'unknown error')
+            if len(err) > 60:
+                err = err[:57] + '...'
+            status_labels['comsol'].configure(text=f'unavailable: {err}')
+
+        update_warning()
+
+        if state['comsol_status'] == 'checking':
+            hint.configure(text="Checking COMSOL server availability...")
+            root.after(300, poll)
+        else:
+            hint.configure(text="Select at least one option.", foreground='#888888')
+            ok_btn.configure(state='normal')
+
+    def discard_comsol_client():
+        # If the background check started a COMSOL server but it ends up
+        # unused (COMSOL not selected, or the dialog is cancelled), shut it
+        # down again rather than leaving an orphaned session running.
+        client = state.get('comsol_client')
+        if client is not None:
+            try:
+                client.clear()
+            except Exception:
+                pass
+            state['comsol_client'] = None
 
     def on_ok():
         if not comsol_var.get() and not origin_var.get():
             # Refuse to close with nothing selected - flag it instead.
             hint.configure(text="Select at least one option.", foreground='#cc0000')
             return
-        result['mode'] = {'comsol': comsol_var.get(), 'origin': origin_var.get()}
+        if not comsol_var.get():
+            discard_comsol_client()
+        result['mode'] = {
+            'comsol': comsol_var.get(),
+            'origin': origin_var.get(),
+            'comsol_client': state['comsol_client'],
+        }
         root.destroy()
 
     def on_cancel():
+        # Tell a still-running background check to clean up after itself
+        # once it finishes, since this dialog won't be around to do it.
+        state['cancelled'] = True
+        discard_comsol_client()
         result['mode'] = None
         root.destroy()
 
     btn_frame = ttk.Frame(container)
-    btn_frame.grid(row=4, column=0, columnspan=3, pady=(15, 0), sticky='e')
+    btn_frame.grid(row=5, column=0, columnspan=3, pady=(15, 0), sticky='e')
     ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side='right')
-    ttk.Button(btn_frame, text="OK", command=on_ok).pack(side='right', padx=(0, 5))
+    ok_btn = ttk.Button(btn_frame, text="OK", command=on_ok, state='disabled')
+    ok_btn.pack(side='right', padx=(0, 5))
 
     root.protocol('WM_DELETE_WINDOW', on_cancel)
+    poll()
     root.mainloop()
     return result['mode']
 
@@ -1035,9 +1189,15 @@ def main():
     args = parser.parse_args()
 
     # -- Decide which steps to run --
-    # If neither --comsol nor --origin was given, ask via a small GUI that
-    # also shows whether COMSOL/OriginLab are currently running (e.g. so the
-    # user can pick Origin-only if COMSOL's license is busy elsewhere).
+    # If neither --comsol nor --origin was given, ask via a single combined
+    # GUI that also runs the COMSOL/OriginLab availability checks
+    # interactively (e.g. so the user can pick Origin-only if COMSOL's
+    # license is busy elsewhere). comsol_client is a COMSOL server already
+    # started by that dialog's background check, ready to be reused -
+    # or None if the dialog was skipped (CLI flags given) or the check
+    # didn't succeed/wasn't needed.
+    mode = None
+    comsol_client = None
     if args.comsol or args.origin:
         do_comsol, do_origin = args.comsol, args.origin
     else:
@@ -1045,12 +1205,16 @@ def main():
         if mode is None:
             sys.exit("Nothing selected. Exiting.")
         do_comsol, do_origin = mode['comsol'], mode['origin']
+        comsol_client = mode.get('comsol_client')
 
     if not do_comsol:
         # -- OriginLab-only mode: import a previously extracted folder --
         # (do_origin is guaranteed True here - the dialog/CLI logic above
         # requires at least one of the two steps.)
-        if not origin_already_running():
+        # When mode is set, the combined dialog already checked and showed
+        # OriginLab's running status inline - only prompt here for the
+        # CLI-flags path, which skips that dialog entirely.
+        if mode is None and not origin_already_running():
             confirm_or_exit(
                 "NOTE: OriginLab does not appear to be running.\n"
                 "Start OriginLab now so --origin can connect to it (originpro "
@@ -1069,7 +1233,9 @@ def main():
             sys.exit("No datasets found to import.")
 
         print("\nPushing results to OriginLab...")
+        origin_pids_before = get_origin_pids()
         push_to_origin(datasets, folder, template=args.origin_template)
+        close_new_origin_processes(origin_pids_before)
         print("Done.")
         return
 
@@ -1096,24 +1262,34 @@ def main():
     print(f"Output folder: {output_dir}")
 
     # -- Pre-flight checks --
-    if comsol_already_running():
-        confirm_or_exit(
-            "WARNING: A COMSOL process is already running. Starting this "
-            "stand-alone session will launch an additional COMSOL engine "
-            "instance, using extra memory and a separate license seat.\n"
-            "Close the existing COMSOL session first if you want to avoid that."
-        )
+    # When mode is set, the combined dialog already checked and showed these
+    # statuses inline (and, for COMSOL, started a server to test it) - only
+    # prompt here for the CLI-flags path, which skips that dialog entirely.
+    if mode is None:
+        if comsol_already_running():
+            confirm_or_exit(
+                "WARNING: A COMSOL process is already running. Starting this "
+                "stand-alone session will launch an additional COMSOL engine "
+                "instance, using extra memory and a separate license seat.\n"
+                "Close the existing COMSOL session first if you want to avoid that."
+            )
 
-    if do_origin and not origin_already_running():
-        confirm_or_exit(
-            "NOTE: OriginLab does not appear to be running.\n"
-            "Start OriginLab now so --origin can connect to it (originpro "
-            "may otherwise fail to launch it automatically)."
-        )
+        if do_origin and not origin_already_running():
+            confirm_or_exit(
+                "NOTE: OriginLab does not appear to be running.\n"
+                "Start OriginLab now so --origin can connect to it (originpro "
+                "may otherwise fail to launch it automatically)."
+            )
 
     # -- Start COMSOL server and load model --
-    print(f"Starting COMSOL server...")
-    client = mph.start()
+    # Reuse the server the mode dialog already started for its availability
+    # check, if any, rather than launching a second one.
+    if comsol_client is not None:
+        client = comsol_client
+        print("Using COMSOL server started during the availability check.")
+    else:
+        print(f"Starting COMSOL server...")
+        client = mph.start()
     print(f"Loading model: {model_path.name}")
     model = client.load(str(model_path))
     print(f"Model loaded.\n")
@@ -1273,7 +1449,9 @@ def main():
     # -- Optional: push to OriginLab --
     if do_origin:
         print("\nPushing results to OriginLab...")
+        origin_pids_before = get_origin_pids()
         push_to_origin(datasets, output_dir, template=args.origin_template)
+        close_new_origin_processes(origin_pids_before)
 
     # -- Clean up --
     client.clear()

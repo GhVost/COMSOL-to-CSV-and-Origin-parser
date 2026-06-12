@@ -26,11 +26,25 @@ python -m venv .venv
 .venv\Scripts\python.exe ComsolExtractor.py
 ```
 
-With no `--comsol`/`--origin` flags, a small dialog appears to pick which
-steps to run - **Extract from COMSOL** and/or **Import into OriginLab** -
-each with a status LED showing whether a COMSOL/OriginLab process is
-currently running (green = running). Pick whichever combination matches
-your situation:
+With no `--comsol`/`--origin` flags, a single combined dialog appears to
+pick which steps to run - **Extract from COMSOL** and/or **Import into
+OriginLab** - and to check their availability interactively:
+
+- **OriginLab**'s LED shows green/grey depending on whether an
+  Origin/OriginPro process is currently running.
+- **COMSOL**'s LED instead reflects a real availability check: the dialog
+  tries to start a COMSOL server (`mph.start()`) in the background as soon
+  as it opens, showing "checking server availability...", then green/"server
+  available" or red/"unavailable: ..." once it completes. The "OK" button is
+  disabled until this finishes.
+- If that check succeeds and **Extract from COMSOL** stays checked, the
+  already-started server is reused for extraction - no second server is
+  launched. If COMSOL is unchecked (or the dialog is cancelled), that test
+  server is shut down again.
+- Warnings that used to be separate "press Enter to continue" prompts (e.g.
+  "OriginLab isn't running yet") are now shown inline in this same window.
+
+Pick whichever combination matches your situation:
 
 - **COMSOL only** — parse the `.mph` model and write CSVs/`manifest.json`,
   without touching OriginLab (e.g. OriginLab isn't installed here, or you
@@ -104,9 +118,22 @@ previously extracted folder you picked, built from its CSVs/`manifest.json`.
   `manifest.json` (via `load_dataset_csv()`/`load_datasets_from_folder()`),
   reconstructing the same `'Name (unit)'` columns as a fresh COMSOL
   extraction would produce.
+- After `push_to_origin()` finishes (with or without `--comsol`), the script
+  closes any Origin/OriginPro process that appeared while it ran (via
+  `get_origin_pids()`/`close_new_origin_processes()`). `originpro` sometimes
+  leaves its own hidden Origin instance running after `op.exit()`, which can
+  otherwise keep the `.opju` file locked for further operations. An Origin
+  session that was already running before the script started is left
+  untouched.
 
 ## Notes
 
+- When neither `--comsol` nor `--origin` is passed, the combined mode-picker
+  dialog (described under Usage) handles all of the interactive checks below
+  itself - inline in that window - including starting a COMSOL server to test
+  its availability. The separate console prompts in this section only apply
+  to the CLI-flags path (`--comsol`/`--origin` given directly), which skips
+  that dialog.
 - Before starting, the script checks whether COMSOL and/or OriginLab are
   already running and prints a prompt if action may be needed:
   - If `--comsol` is selected and a COMSOL process is already running,
@@ -116,9 +143,6 @@ previously extracted folder you picked, built from its CSVs/`manifest.json`.
   - If `--origin` is selected and OriginLab isn't running yet, start it so
     `originpro` can connect to it.
   - Each prompt waits for Enter to continue, or Ctrl+C to abort.
-- The mode-selection dialog (shown when neither `--comsol` nor `--origin` is
-  passed) displays a green/grey LED next to each option reflecting these
-  same running-process checks.
 - `--origin` requires OriginLab to be installed on the same machine.
 - `--comsol` requires COMSOL Multiphysics to be installed and licensed on
   the same machine.
