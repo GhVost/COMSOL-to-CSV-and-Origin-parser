@@ -47,9 +47,10 @@ Module layout (in order):
                             everything together and writes manifest.json.
 """
 
-__version__ = '1.1.0'
+__version__ = '1.2.0'
 
 import argparse
+import os
 import sys
 import re
 import csv
@@ -1231,6 +1232,8 @@ def main():
         origin_pids_before = get_origin_pids()
         push_to_origin(datasets, folder, template=args.origin_template)
         close_new_origin_processes(origin_pids_before)
+
+        os.startfile(folder)  # open the results folder in File Explorer
         print("Done.")
         return
 
@@ -1448,7 +1451,8 @@ def main():
         push_to_origin(datasets, output_dir, template=args.origin_template)
         close_new_origin_processes(origin_pids_before)
 
-    # -- Clean up --
+    # -- Open the output folder and clean up --
+    os.startfile(output_dir)  # open the results folder in File Explorer
     client.clear()
     print("Done.")
 
