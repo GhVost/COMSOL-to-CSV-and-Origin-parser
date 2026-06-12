@@ -71,6 +71,18 @@ the dialog is skipped.
 This opens a file picker to choose the `.mph` model, extracts everything,
 and builds an OriginLab project (`.opju`).
 
+When `--comsol`/`--origin` are given directly, this skips the combined
+dialog above, but the script still checks beforehand whether COMSOL/OriginLab
+are already running and prompts if action may be needed:
+
+- If `--comsol` is selected and a COMSOL process is already running,
+  starting this script's own session will use an additional engine instance
+  and license seat — close the existing session first if you want to avoid
+  that.
+- If `--origin` is selected and OriginLab isn't running yet, start it so
+  `originpro` can connect to it.
+- Each prompt waits for Enter to continue, or Ctrl+C to abort.
+
 Other options:
 
 - `ComsolExtractor.py model.mph --comsol` — extract a specific model (skips
@@ -131,23 +143,16 @@ previously extracted folder you picked, built from its CSVs/`manifest.json`.
   session that was already running before the script started is left
   untouched.
 
-## Notes
+## Disclaimer
 
-- When neither `--comsol` nor `--origin` is passed, the combined mode-picker
-  dialog (described under Usage) handles all of the interactive checks below
-  itself - inline in that window - including starting a COMSOL server to test
-  its availability. The separate console prompts in this section only apply
-  to the CLI-flags path (`--comsol`/`--origin` given directly), which skips
-  that dialog.
-- Before starting, the script checks whether COMSOL and/or OriginLab are
-  already running and prints a prompt if action may be needed:
-  - If `--comsol` is selected and a COMSOL process is already running,
-    starting this script's own session will use an additional engine
-    instance and license seat — close the existing session first if you
-    want to avoid that.
-  - If `--origin` is selected and OriginLab isn't running yet, start it so
-    `originpro` can connect to it.
-  - Each prompt waits for Enter to continue, or Ctrl+C to abort.
-- `--origin` requires OriginLab to be installed on the same machine.
-- `--comsol` requires COMSOL Multiphysics to be installed and licensed on
-  the same machine.
+This is an independent, unofficial tool and is not affiliated with,
+endorsed by, or sponsored by COMSOL AB or OriginLab Corporation.
+
+- COMSOL, COMSOL Multiphysics, and COMSOL Server are trademarks or
+  registered trademarks of COMSOL AB.
+- OriginLab, Origin, and OriginPro are trademarks or registered trademarks
+  of OriginLab Corporation.
+
+Using `--comsol` or `--origin` requires a valid, separately obtained
+license for COMSOL Multiphysics and/or OriginLab, respectively - neither
+is provided by or included with this project.
