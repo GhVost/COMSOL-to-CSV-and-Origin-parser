@@ -119,28 +119,34 @@ def write_csv_with_comments(df: pd.DataFrame, path: Path, comments: list[str] | 
             writer.writerow(row)
 
 
-def load_dataset_csv(path: Path) -> tuple[pd.DataFrame, list[str]]:
+def load_dataset_csv(path: Path, low_memory: bool = False) -> tuple[pd.DataFrame, list[str]]:
     """Read a CSV written by write_csv_with_comments() back into a
     (DataFrame, comments) pair, recombining the two header rows into
     'Name (unit)' columns - used to re-import a '<model>_results' folder into
-    OriginLab without COMSOL running again.
+    OriginLab without COMSOL running again. Only the leading comment/header
+    lines are read up front (not the whole file - see read_leading_comments)
+    before the data itself is parsed directly from disk. low_memory parses
+    into float32 instead of float64 (see parse_comsol_export).
     """
-    with open(path, 'r', encoding='utf-8', newline='') as f:
-        lines = f.readlines()
-
     comments = []
-    i = 0
-    while i < len(lines) and lines[i].startswith('%'):
-        comments.append(lines[i][1:].strip())
-        i += 1
+    n_comment_lines = 0
+    with open(path, 'r', encoding='utf-8', newline='') as f:
+        for line in f:
+            if not line.startswith('%'):
+                names = next(csv.reader([line]))
+                units = next(csv.reader([f.readline()]))
+                break
+            comments.append(line[1:].strip())
+            n_comment_lines += 1
 
     labels, comments = extract_legend_labels_from_comments(comments)
-
-    names = next(csv.reader([lines[i]]))
-    units = next(csv.reader([lines[i + 1]]))
     headers = [f"{name} ({unit})" if unit else name for name, unit in zip(names, units)]
 
-    df = pd.read_csv(path, skiprows=i + 2, header=None, names=headers)
+    df = pd.read_csv(path, skiprows=n_comment_lines + 2, header=None, names=headers)
+    if low_memory:
+        float_cols = df.select_dtypes('float64').columns
+        if len(float_cols):
+            df[float_cols] = df[float_cols].astype('float32')
     set_legend_labels(df, labels)
     return df, comments
 
@@ -245,6 +251,27 @@ def line_markers(df: pd.DataFrame) -> list[dict]:
     return markers
 
 
+# Preview plots stay responsive/within memory above this row count - large
+# point counts are what make matplotlib's triangulated surfaces slow or
+# crash-prone, independent of how much memory parsing itself used.
+PREVIEW_MAX_PLOT_POINTS = 50_000
+
+
+def subsample_for_plot(df: pd.DataFrame, max_points: int = PREVIEW_MAX_PLOT_POINTS) -> pd.DataFrame:
+    """Return a systematic (every-Nth-row) subsample of df for plotting.
+
+    Preserves row order (so monotonic sweeps/segment-splitting logic stays
+    correct) and keeps all columns row-aligned (so a deformed/undeformed
+    coordinate pair - see merge_undeformed_reference() - samples together).
+    df itself, and the caller's other uses of it (e.g. the Data tab), are
+    unaffected - this returns a new, independent DataFrame.
+    """
+    if len(df) <= max_points:
+        return df
+    stride = max(1, len(df) // max_points)
+    return df.iloc[::stride]
+
+
 def surface_columns(df: pd.DataFrame, kind: str) -> tuple[str, str, str, str | None] | None:
     """Pick coordinate/value columns for 2D/3D surface previews.
 
@@ -347,13 +374,15 @@ def discover_items(model) -> list[dict]:
     return items
 
 
-def extract_table(model, tag: str) -> tuple[pd.DataFrame, list[str]] | None:
+def extract_table(model, tag: str, low_memory: bool = False) -> tuple[pd.DataFrame, list[str]] | None:
     """Extract a COMSOL result table into a DataFrame, plus any user comments.
 
     Column headers (with units, e.g. 'freq (GHz)') come from the table's
     'headers' property - a [index, description] matrix - while the data
     comes from getTableData(True) as strings (COMSOL 6.4 dropped the no-arg
-    getTableData()/getColumnHeader()/getDoubleValue() API).
+    getTableData()/getColumnHeader()/getDoubleValue() API). low_memory
+    parses into float32 instead of float64, halving the table's memory for
+    a precision loss well below COMSOL's own exported significant digits.
     """
     try:
         tbl = model.java.result().table(tag)
@@ -361,8 +390,15 @@ def extract_table(model, tag: str) -> tuple[pd.DataFrame, list[str]] | None:
 
         # Each cell is a Java String (e.g. "3.4065" or "inf"/"NaN"); convert
         # via str() first - Python's float() accepts "inf"/"NaN" natively.
+        # Filled into a preallocated array directly rather than building a
+        # nested Python list first, which for a large table would otherwise
+        # briefly hold both the list-of-floats and the final array at once.
         rows = tbl.getTableData(True)
-        data = np.array([[float(str(cell)) for cell in row] for row in rows], dtype=float)
+        dtype = np.float32 if low_memory else np.float64
+        data = np.empty((len(rows), len(headers)), dtype=dtype)
+        for i, row in enumerate(rows):
+            for j, cell in enumerate(row):
+                data[i, j] = float(str(cell))
 
         df = pd.DataFrame(data, columns=headers)
 
@@ -386,14 +422,17 @@ def extract_table(model, tag: str) -> tuple[pd.DataFrame, list[str]] | None:
 # across COMSOL versions than the feature-level data API.
 # ---------------------------------------------------------------------------
 
-def export_via_comsol(model, pg_tag: str, output_dir: Path) -> Path | None:
+def export_via_comsol(model, pg_tag: str, output_dir: Path, suffix: str = '') -> Path | None:
     """Use COMSOL's native 'Plot' export to dump a plot group to a text file,
     falling back to the system temp directory if COMSOL refuses to write
-    into output_dir (locking, permissions, ...)."""
-    fname = sanitize_filename(pg_tag) + '_export.txt'
+    into output_dir (locking, permissions, ...). suffix distinguishes a
+    repeated export of the same plot group (e.g. a deformation-off
+    reference pass, see export_undeformed_reference()) so the temp export
+    node/file don't collide with a still-pending export of the same tag."""
+    fname = sanitize_filename(pg_tag) + suffix + '_export.txt'
     # Temporary export-node tag; created and removed within this function so
     # repeated calls don't accumulate leftover export nodes in the model.
-    export_tag = f'exp_{pg_tag}'
+    export_tag = f'exp_{pg_tag}{suffix}'
 
     for target_dir in (output_dir, Path(tempfile.gettempdir())):
         export_path = target_dir / fname
@@ -513,6 +552,148 @@ def get_geometry_length_unit(model, pg) -> str:
         return str(model.java.geom(geom_tag).lengthUnit())
     except Exception:
         return ''
+
+
+# ---------------------------------------------------------------------------
+# Deformation - 2D/3D plots often carry a Deformation sub-feature (nested
+# under Surface/Arrow/...) that displaces the plotted geometry for display.
+# COMSOL's Plot export already bakes this in at whatever scale the feature
+# is configured with; a second export with it toggled off recovers the
+# undeformed reference geometry, letting the preview exaggerate the
+# deformation by an arbitrary factor instead of only COMSOL's own scale.
+# ---------------------------------------------------------------------------
+
+# Above this primary-export size, skip the second (undeformed-reference)
+# export pass rather than roughly doubling peak memory for an already large
+# plot - see extract_via_export().
+DEFORMATION_REFERENCE_MAX_BYTES = 150 * 1024 * 1024
+
+def find_deformation_feature(pg):
+    """Locate a plot group's Deformation sub-feature (e.g. under a Surface
+    or Arrow plot), if any. COMSOL auto-tags these with a 'defm' prefix;
+    fall back to the feature type string for other naming/versions."""
+    def is_deformation(tag: str, feat) -> bool:
+        if tag.lower().startswith('defm'):
+            return True
+        try:
+            return 'deform' in str(feat.getType()).lower()
+        except Exception:
+            return False
+
+    def visit(container):
+        try:
+            tags = [str(t) for t in container.feature().tags()]
+        except Exception:
+            return None
+        children = [(tag, container.feature(tag)) for tag in tags]
+        for tag, feat in children:
+            if is_deformation(tag, feat):
+                return feat
+        for _, feat in children:
+            found = visit(feat)
+            if found is not None:
+                return found
+        return None
+
+    try:
+        return visit(pg)
+    except Exception:
+        return None
+
+
+def get_deformation_scale_info(feat) -> dict:
+    """Best-effort read of a Deformation feature's active/scale settings,
+    for documentation in the exported '%' comments."""
+    info = {'active': True, 'scale': None, 'auto_scale': None}
+    try:
+        info['active'] = bool(feat.isActive())
+    except Exception:
+        pass
+    try:
+        info['scale'] = float(feat.getDouble('scale'))
+    except Exception:
+        pass
+    try:
+        info['auto_scale'] = str(feat.getString('scaleactive')).lower() != 'manual'
+    except Exception:
+        pass
+    return info
+
+
+def deformation_comment(info: dict) -> str:
+    """Format deformation metadata for a CSV '%' comment line."""
+    if info.get('scale') is not None:
+        mode = 'auto' if info.get('auto_scale') else 'manual'
+        return f"Deformation: scale={info['scale']:.4g} ({mode})"
+    return "Deformation: active"
+
+
+def export_undeformed_reference(model, pg, pg_tag: str, deform_feat,
+                                 units_map: dict[str, str], coordinate_unit: str,
+                                 low_memory: bool = False) -> pd.DataFrame | None:
+    """Re-export a plot group with its Deformation feature temporarily
+    disabled, returning just the resulting (undeformed) coordinate
+    DataFrame. Always restores the feature's active state, even on failure.
+    Exports to the system temp directory only - this is an internal
+    computation aid, not part of the saved output."""
+    try:
+        deform_feat.active(False)
+    except Exception:
+        return None
+    try:
+        export_path = export_via_comsol(model, pg_tag, Path(tempfile.gettempdir()),
+                                        suffix='_undeformed')
+        if export_path is None:
+            return None
+        try:
+            result = parse_comsol_export(export_path, units_map, coordinate_unit,
+                                         low_memory=low_memory)
+        finally:
+            try:
+                export_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return result[0] if result else None
+    except Exception:
+        return None
+    finally:
+        try:
+            deform_feat.active(True)
+        except Exception:
+            pass
+
+
+def merge_undeformed_reference(df: pd.DataFrame, kind: str, undeformed_df: pd.DataFrame) -> pd.DataFrame:
+    """Append undeformed reference coordinate columns ('Undeformed <col>'),
+    positionally aligned with df's own coordinate columns, for use by the
+    preview's exaggeration slider (see exaggerate_coordinates()). df is
+    returned unchanged if the two exports don't line up (different row/
+    column counts - e.g. a COMSOL version where deformation.active() didn't
+    actually change the export)."""
+    n_coord = 3 if kind == '3d' else 2
+    if len(undeformed_df) != len(df) or undeformed_df.shape[1] < n_coord or df.shape[1] < n_coord:
+        return df
+    df = df.copy()
+    for i in range(n_coord):
+        df[f"Undeformed {undeformed_df.columns[i]}"] = undeformed_df.iloc[:, i].to_numpy()
+    return df
+
+
+def deformation_reference_columns(df: pd.DataFrame, kind: str) -> list[str] | None:
+    """Return the 'Undeformed <col>' reference columns added by
+    merge_undeformed_reference(), matching surface_columns()'s coordinate
+    count/order for the given plot kind, or None if not present."""
+    n_coord = 3 if kind == '3d' else 2
+    cols = [c for c in df.columns if str(c).startswith('Undeformed ')]
+    return cols[:n_coord] if len(cols) >= n_coord else None
+
+
+def exaggerate_coordinates(deformed: np.ndarray, undeformed: np.ndarray, factor: float) -> np.ndarray:
+    """Blend/extrapolate between undeformed reference geometry and COMSOL's
+    own deformed coordinates by factor: 1.0 reproduces COMSOL's configured
+    scale exactly, 0.0 is the undeformed geometry, and values beyond 1.0
+    exaggerate the displacement further."""
+    return undeformed + factor * (deformed - undeformed)
 
 
 def split_header_line(header_line: str, ncols: int) -> list[str] | None:
@@ -637,9 +818,30 @@ def get_plot_legend_labels(pg) -> list[str]:
     return labels
 
 
+def read_leading_comments(path: Path) -> list[str]:
+    """Read just the leading '%'-prefixed comment/header lines from a COMSOL
+    text export, stopping at the first data line.
+
+    COMSOL's comments are always a contiguous block at the top of the file
+    (see parse_comsol_export), so this never needs to hold the file's data
+    rows in memory - unlike loading the whole file as one string just to
+    filter it, which peaks at several times the file size for a large mesh
+    export and is a common cause of out-of-memory crashes on big models.
+    """
+    comments = []
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            line = repair_mojibake(line.rstrip('\r\n'))
+            if not line.startswith('%'):
+                break
+            comments.append(line[1:].strip())
+    return comments
+
+
 def parse_comsol_export(path: Path, units_map: dict[str, str] | None = None,
                          coordinate_unit: str = '',
-                         fallback_headers: list[str] | None = None) -> tuple[pd.DataFrame, list[str]] | None:
+                         fallback_headers: list[str] | None = None,
+                         low_memory: bool = False) -> tuple[pd.DataFrame, list[str]] | None:
     """Parse a COMSOL text export into (DataFrame, metadata comment lines).
 
     COMSOL prefixes the file with '%' lines holding metadata (Model, Version,
@@ -650,10 +852,11 @@ def parse_comsol_export(path: Path, units_map: dict[str, str] | None = None,
     the header text; coordinate_unit (see get_geometry_length_unit) fills in
     spatial-coordinate columns (COORDINATE_NAMES). If the export has no
     usable header line, fallback_headers (see get_table_graph_headers) is
-    used if its length matches the data's column count.
+    used if its length matches the data's column count. low_memory downcasts
+    the parsed float64 columns to float32 - roughly halving the DataFrame's
+    memory for a precision loss well below COMSOL's own exported digits.
     """
-    text = repair_mojibake(path.read_text(encoding='utf-8', errors='replace'))
-    comment_lines = [line[1:].strip() for line in text.splitlines() if line.startswith('%')]
+    comment_lines = read_leading_comments(path)
 
     try:
         df = pd.read_csv(path, comment='%', sep=r'\s+', header=None)
@@ -661,6 +864,10 @@ def parse_comsol_export(path: Path, units_map: dict[str, str] | None = None,
         return None
     if df.empty:
         return None
+    if low_memory:
+        float_cols = df.select_dtypes('float64').columns
+        if len(float_cols):
+            df[float_cols] = df[float_cols].astype('float32')
 
     headers = None
     meta = comment_lines
@@ -699,15 +906,28 @@ def parse_comsol_export(path: Path, units_map: dict[str, str] | None = None,
     return df, meta
 
 
-def extract_via_export(model, pg, pg_tag: str, output_dir: Path) -> tuple[pd.DataFrame, list[str]] | None:
-    """Extract a plot group's data via COMSOL's native text export into a DataFrame."""
+def extract_via_export(model, pg, pg_tag: str, output_dir: Path,
+                        kind: str = '', low_memory: bool = False) -> tuple[pd.DataFrame, list[str]] | None:
+    """Extract a plot group's data via COMSOL's native text export into a DataFrame.
+
+    For 2D/3D plot groups (kind) with an active Deformation sub-feature, a
+    second export with the deformation temporarily disabled adds undeformed
+    reference coordinate columns alongside the already-deformed ones (see
+    merge_undeformed_reference()), and the feature's scale is recorded as a
+    '%' comment - together letting the preview show the geometry at an
+    exaggeration factor independent of COMSOL's own configured scale.
+    low_memory parses into float32 instead of float64 (see
+    parse_comsol_export).
+    """
     export_path = export_via_comsol(model, pg_tag, output_dir)
     if export_path is None:
         return None
 
     try:
-        result = parse_comsol_export(export_path, get_feature_units(pg), get_geometry_length_unit(model, pg),
-                                     get_table_graph_headers(model, pg))
+        units_map = get_feature_units(pg)
+        coordinate_unit = get_geometry_length_unit(model, pg)
+        result = parse_comsol_export(export_path, units_map, coordinate_unit,
+                                     get_table_graph_headers(model, pg), low_memory=low_memory)
         if result is None:
             return None
         df, comments = result
@@ -715,6 +935,33 @@ def extract_via_export(model, pg, pg_tag: str, output_dir: Path) -> tuple[pd.Dat
         labels = get_plot_legend_labels(pg)
         if len(labels) == len(segments):
             set_legend_labels(df, labels)
+
+        if kind in ('2d', '3d'):
+            deform_feat = find_deformation_feature(pg)
+            if deform_feat is not None:
+                info = get_deformation_scale_info(deform_feat)
+                if info.get('active', True):
+                    comments = comments + [deformation_comment(info)]
+                    try:
+                        export_too_large = export_path.stat().st_size > DEFORMATION_REFERENCE_MAX_BYTES
+                    except OSError:
+                        export_too_large = False
+                    if export_too_large:
+                        # Skip the second (undeformed-reference) export pass
+                        # for very large plots - it would roughly double an
+                        # already large peak memory footprint. The primary
+                        # (deformed) data is unaffected either way.
+                        comments = comments + [
+                            "Deformation: undeformed reference skipped "
+                            f"(export exceeds {DEFORMATION_REFERENCE_MAX_BYTES // (1024 * 1024)} MB)"
+                        ]
+                    else:
+                        undeformed_df = export_undeformed_reference(
+                            model, pg, pg_tag, deform_feat, units_map, coordinate_unit,
+                            low_memory=low_memory)
+                        if undeformed_df is not None:
+                            df = merge_undeformed_reference(df, kind, undeformed_df)
+
         return df, comments
     except Exception as e:
         print(f"  [!] Could not parse export for '{pg_tag}': {e}")

@@ -80,14 +80,15 @@ def start_originpro() -> tuple[bool, str]:
         return False, str(e)
 
 
-def load_datasets_from_folder(folder: Path) -> list[dict]:
+def load_datasets_from_folder(folder: Path, low_memory: bool = False) -> list[dict]:
     """Load CSVs from a previously written '<model>_results' folder for
     direct OriginLab import via push_to_origin(), without re-running the
     COMSOL extraction (e.g. when COMSOL isn't installed/licensed here, or its
     license is busy elsewhere).
 
     Uses manifest.json to find each extracted file and which section it
-    belongs to, then reads it back with load_dataset_csv().
+    belongs to, then reads it back with load_dataset_csv(). low_memory
+    parses into float32 instead of float64 (see parse_comsol_export).
     """
     manifest_path = folder / 'manifest.json'
     if not manifest_path.exists():
@@ -116,7 +117,7 @@ def load_datasets_from_folder(folder: Path) -> list[dict]:
             if not path.exists():
                 print(f"  [!] Missing file referenced in manifest: {fname}")
                 continue
-            df, comments = load_dataset_csv(path)
+            df, comments = load_dataset_csv(path, low_memory=low_memory)
             datasets.append({'name': Path(fname).stem, 'kind': kind, 'df': df,
                               'comments': comments or entry.get('comments', [])})
             print(f"  - Loaded {fname}  ({len(df)} rows x {len(df.columns)} cols)")
@@ -192,6 +193,12 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = '') -> Path
                     pass
                 layer.rescale()
                 graph.lname = name
+
+            # Origin's worksheet now holds this dataset's data; drop the
+            # Python-side copy so a multi-item batch doesn't keep every
+            # already-imported DataFrame alive until the whole push finishes.
+            entry['df'] = None
+            del df
 
             print(f"  -> Imported: {name}")
 

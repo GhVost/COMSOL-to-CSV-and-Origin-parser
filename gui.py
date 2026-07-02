@@ -10,6 +10,7 @@ import time
 import traceback
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 try:
@@ -28,10 +29,14 @@ except ImportError:
     )
 
 from extraction import (
-    discover_items, extract_table, extract_via_export, legend_label_from_column,
-    line_markers, line_series_dataframe, surface_columns,
+    deformation_reference_columns, discover_items, exaggerate_coordinates,
+    extract_table, extract_via_export, legend_label_from_column, line_markers,
+    line_series_dataframe, subsample_for_plot, surface_columns,
 )
-from license_check import query_license_usage, summarize_lmstat
+from license_check import (
+    load_mask_hosts_setting, query_license_usage, save_mask_hosts_setting,
+    summarize_lmstat,
+)
 from origin_push import origin_already_running, start_originpro
 
 
@@ -64,12 +69,17 @@ PREVIEW_LINE_COLORS = ['#0072B2', '#E69F00', '#009E73', '#CC79A7', '#D55E00', '#
 PREVIEW_MAX_ROWS = 2000  # Data tab caps preview rows; the CSV has the full data
 
 
-def make_preview_figure(df: pd.DataFrame, kind: str, surface_alpha: float = 0.78):
+def make_preview_figure(df: pd.DataFrame, kind: str, surface_alpha: float = 0.78,
+                        exaggeration: float = 1.0):
     """Build a matplotlib Figure previewing a dataset.
 
     Tables are intentionally not plotted. 1D data is drawn as separate line
     series with peak markers. 2D/3D data is rendered as a triangulated
-    surface so COMSOL deformation coordinates remain visible.
+    surface so COMSOL deformation coordinates remain visible. When an
+    undeformed reference geometry was captured (see
+    extraction.merge_undeformed_reference()), exaggeration scales the
+    displacement away from COMSOL's own configured deformation scale
+    (1.0 = as COMSOL shows it, 0.0 = undeformed, >1.0 = exaggerated further).
     """
     try:
         from matplotlib.figure import Figure
@@ -79,26 +89,36 @@ def make_preview_figure(df: pd.DataFrame, kind: str, surface_alpha: float = 0.78
     if kind == 'table':
         return None
 
+    df = subsample_for_plot(df)
     num = df.select_dtypes('number')
     if num.shape[1] < 2:
         return None
 
     fig = Figure(figsize=(5, 4), layout='tight')
     surface = surface_columns(df, kind)
+    ref_cols = deformation_reference_columns(df, kind) if surface else None
+
+    def positions(cols: tuple[str, ...]) -> list[np.ndarray]:
+        """Exaggerated coordinate arrays for the surface's spatial columns."""
+        deformed = [num[c].to_numpy() for c in cols]
+        if ref_cols is None or exaggeration == 1.0:
+            return deformed
+        undeformed = [df[c].to_numpy() for c in ref_cols]
+        return [exaggerate_coordinates(d, u, exaggeration) for d, u in zip(deformed, undeformed)]
+
     if kind == '3d' and surface:
         x_col, y_col, z_col, value_col = surface
+        x, y, z = positions((x_col, y_col, z_col))
         ax = fig.add_subplot(projection='3d')
         if value_col and value_col != z_col:
-            surf = ax.plot_trisurf(num[x_col], num[y_col], num[z_col],
-                                   cmap='viridis', linewidth=0.1,
+            surf = ax.plot_trisurf(x, y, z, cmap='viridis', linewidth=0.1,
                                    antialiased=True, shade=True,
                                    alpha=surface_alpha)
             surf.set_array(num[value_col].to_numpy())
             surf.autoscale()
             fig.colorbar(surf, ax=ax, label=str(value_col), shrink=0.7)
         else:
-            surf = ax.plot_trisurf(num[x_col], num[y_col], num[z_col],
-                                   cmap='viridis', linewidth=0.1,
+            surf = ax.plot_trisurf(x, y, z, cmap='viridis', linewidth=0.1,
                                    antialiased=True, alpha=surface_alpha)
             fig.colorbar(surf, ax=ax, label=str(z_col), shrink=0.7)
         ax.set_xlabel(str(x_col))
@@ -106,11 +126,10 @@ def make_preview_figure(df: pd.DataFrame, kind: str, surface_alpha: float = 0.78
         ax.set_zlabel(str(z_col))
     elif kind == '2d' and surface:
         x_col, y_col, value_col, _ = surface
+        x, y = positions((x_col, y_col))
         ax = fig.add_subplot()
-        filled = ax.tricontourf(num[x_col], num[y_col], num[value_col],
-                                levels=32, cmap='viridis')
-        ax.tricontour(num[x_col], num[y_col], num[value_col],
-                      levels=12, colors='k', linewidths=0.25, alpha=0.35)
+        filled = ax.tricontourf(x, y, num[value_col], levels=32, cmap='viridis')
+        ax.tricontour(x, y, num[value_col], levels=12, colors='k', linewidths=0.25, alpha=0.35)
         fig.colorbar(filled, ax=ax, label=str(value_col))
         ax.set_xlabel(str(x_col))
         ax.set_ylabel(str(y_col))
@@ -138,6 +157,87 @@ def make_preview_figure(df: pd.DataFrame, kind: str, surface_alpha: float = 0.78
     return fig
 
 
+def build_preview_plot_widget(df: pd.DataFrame, kind: str):
+    """Build a preview's 'Plot' tab: the matplotlib canvas, plus any
+    interactive controls - a 3D surface-opacity slider, and a deformation
+    exaggeration slider for 2D/3D plots carrying an undeformed reference
+    geometry (see extraction.merge_undeformed_reference()). Sliders rebuild
+    the whole figure (trisurf/tricontourf have no cheap in-place coordinate
+    update) and swap the canvas widget in place. Returns None if there is
+    nothing plottable (see make_preview_figure())."""
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+
+    if kind not in ('2d', '3d'):
+        fig = make_preview_figure(df, kind)
+        return FigureCanvasQTAgg(fig) if fig is not None else None
+
+    has_deformation = deformation_reference_columns(df, kind) is not None
+    plot_state = {'alpha': 0.78, 'exaggeration': 1.0}
+    widget = QWidget()
+    layout = QVBoxLayout(widget)
+    layout.setContentsMargins(0, 0, 0, 0)
+    canvas_holder = {'canvas': None}
+
+    def refresh():
+        fig = make_preview_figure(df, kind, surface_alpha=plot_state['alpha'],
+                                  exaggeration=plot_state['exaggeration'])
+        if fig is None:
+            return
+        new_canvas = FigureCanvasQTAgg(fig)
+        old_canvas = canvas_holder['canvas']
+        if old_canvas is not None:
+            layout.replaceWidget(old_canvas, new_canvas)
+            old_canvas.setParent(None)
+            old_canvas.deleteLater()
+        else:
+            layout.insertWidget(0, new_canvas, 1)
+        canvas_holder['canvas'] = new_canvas
+
+    refresh()
+    if canvas_holder['canvas'] is None:
+        return None  # nothing plottable (e.g. fewer than 2 numeric columns)
+
+    if kind == '3d':
+        alpha_row = QHBoxLayout()
+        alpha_row.addWidget(QLabel("Surface opacity:"))
+        alpha_slider = QSlider(Qt.Orientation.Horizontal)
+        alpha_slider.setRange(15, 100)
+        alpha_slider.setValue(78)
+        alpha_value = QLabel("78%")
+        alpha_row.addWidget(alpha_slider, 1)
+        alpha_row.addWidget(alpha_value)
+        layout.addLayout(alpha_row)
+
+        def on_alpha(value: int):
+            plot_state['alpha'] = value / 100
+            alpha_value.setText(f"{value}%")
+            refresh()
+
+        alpha_slider.valueChanged.connect(on_alpha)
+
+    if has_deformation:
+        exag_row = QHBoxLayout()
+        exag_row.addWidget(QLabel("Deformation exaggeration:"))
+        exag_slider = QSlider(Qt.Orientation.Horizontal)
+        exag_slider.setRange(0, 500)
+        exag_slider.setValue(100)
+        exag_value = QLabel("100% (COMSOL scale)")
+        exag_row.addWidget(exag_slider, 1)
+        exag_row.addWidget(exag_value)
+        layout.addLayout(exag_row)
+
+        def on_exaggeration(value: int):
+            plot_state['exaggeration'] = value / 100
+            suffix = (" (COMSOL scale)" if value == 100
+                     else " (undeformed)" if value == 0 else "")
+            exag_value.setText(f"{value}%{suffix}")
+            refresh()
+
+        exag_slider.valueChanged.connect(on_exaggeration)
+
+    return widget
+
+
 def make_data_table(df: pd.DataFrame) -> QTableWidget:
     """Read-only spreadsheet view of a DataFrame for a preview's Data tab."""
     nrows = min(len(df), PREVIEW_MAX_ROWS)
@@ -161,7 +261,8 @@ ITEM_GROUP_LABELS = {
 
 
 def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
-                           push_to_origin_default: bool) -> dict | None:
+                           push_to_origin_default: bool,
+                           low_memory_default: bool = False) -> dict | None:
     """Open the combined status/items window immediately. An Open button
     picks the .mph model (skipped if model_path is already given, e.g. from
     the command line); COMSOL starts and loads it in a background thread
@@ -176,8 +277,9 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
     FlexNet (FNL) seats of the COMSOL modules, filterable by host pattern.
 
     Returns {'client': ..., 'model': ..., 'model_path': ...,
-    'items': [...selected items...], 'push_to_origin': bool}, or None if
-    cancelled (closed the window or clicked Cancel, before or after loading).
+    'items': [...selected items...], 'push_to_origin': bool,
+    'low_memory': bool}, or None if cancelled (closed the window or clicked
+    Cancel, before or after loading).
     """
     app = qt_app()
 
@@ -248,6 +350,15 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
     push_check.setChecked(push_to_origin_default)
     status_layout.addWidget(push_check)
 
+    low_memory_check = QCheckBox("Low memory (parse as float32)")
+    low_memory_check.setChecked(low_memory_default)
+    low_memory_check.setToolTip(
+        "Halves the memory used by large 2D/3D plots and tables by parsing "
+        "into float32 instead of float64 - a precision loss well below "
+        "COMSOL's own exported significant digits. Turn on if extraction "
+        "crashes or runs out of memory on large models.")
+    status_layout.addWidget(low_memory_check)
+
     def refresh_origin_led() -> bool:
         running = origin_already_running()
         set_led(origin_led, '#2ecc40' if running else '#b0b0b0')
@@ -317,7 +428,7 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
              'pending_preview': None,
              'worker_start': time.monotonic(), 'lmstat_raw': '',
              'license_info': '', 'status_text': ''}
-    result = {'items': None, 'push_to_origin': False}
+    result = {'items': None, 'push_to_origin': False, 'low_memory': False}
 
     def populate_items(items):
         # One checkable row per item, under bold headings by kind; a new
@@ -351,6 +462,7 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
             if entry.checkState() == Qt.CheckState.Checked
         ]
         result['push_to_origin'] = push_check.isChecked()
+        result['low_memory'] = low_memory_check.isChecked()
         win.close()
 
     # Buttons in work-sequence order: Open >> Select/Deselect >> Extract.
@@ -380,6 +492,7 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
     # needed.
     class WorkerSignals(QObject):
         status = Signal(str)
+        server_ready = Signal()
         ready = Signal(object, list)
         error = Signal(str)
         preview = Signal(object, object)   # item, (df, comments) or None
@@ -407,6 +520,7 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
                     return
             else:
                 client.clear()  # drop the previously opened model
+            signals.server_ready.emit()  # COMSOL engine is up - LED can go green now
             signals.status.emit(f"Loading model: {path.name}")
             model = client.load(str(path))
             signals.status.emit("Discovering extractable items...")
@@ -446,6 +560,10 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         state['status_text'] = text
         status_bar.setText(text)
 
+    def on_server_ready():
+        set_led(comsol_led, '#2ecc40')
+        comsol_label.setText("COMSOL: server running - loading model...")
+
     def on_ready(model, items):
         state['model'], state['items'] = model, items
         elapsed_timer.stop()
@@ -471,6 +589,7 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         print(f"\n[!] {text}")
 
     signals.status.connect(on_status)
+    signals.server_ready.connect(on_server_ready)
     signals.ready.connect(on_ready)
     signals.error.connect(on_error)
 
@@ -506,13 +625,16 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         state['pending_preview'] = None
         status_bar.setText(f"Extracting preview of '{tag}'...")
 
+        low_memory = low_memory_check.isChecked()
+
         def preview_worker():
             try:
                 if item['kind'] == 'table':
-                    data = extract_table(state['model'], tag)
+                    data = extract_table(state['model'], tag, low_memory=low_memory)
                 else:
                     data = extract_via_export(state['model'], item['pg'], tag,
-                                              Path(tempfile.gettempdir()))
+                                              Path(tempfile.gettempdir()), kind=item['kind'],
+                                              low_memory=low_memory)
             except Exception:
                 traceback.print_exc()
                 data = None
@@ -533,42 +655,10 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         df = data[0]
         tabs = QTabWidget()
         try:
-            if item['kind'] != 'table':
-                fig = make_preview_figure(df, item['kind'])
-            else:
-                fig = None
-            if fig is not None:
-                from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-                canvas = FigureCanvasQTAgg(fig)
-                if item['kind'] == '3d':
-                    plot_widget = QWidget()
-                    plot_layout = QVBoxLayout(plot_widget)
-                    plot_layout.setContentsMargins(0, 0, 0, 0)
-                    plot_layout.addWidget(canvas, 1)
-
-                    slider_row = QHBoxLayout()
-                    slider_row.addWidget(QLabel("Surface opacity:"))
-                    alpha_slider = QSlider(Qt.Orientation.Horizontal)
-                    alpha_slider.setRange(15, 100)
-                    alpha_slider.setValue(78)
-                    alpha_value = QLabel("78%")
-                    slider_row.addWidget(alpha_slider, 1)
-                    slider_row.addWidget(alpha_value)
-                    plot_layout.addLayout(slider_row)
-
-                    def update_surface_alpha(value: int, fig=fig, canvas=canvas,
-                                             label=alpha_value):
-                        alpha = value / 100
-                        label.setText(f"{value}%")
-                        for ax in fig.axes:
-                            for collection in ax.collections:
-                                collection.set_alpha(alpha)
-                        canvas.draw_idle()
-
-                    alpha_slider.valueChanged.connect(update_surface_alpha)
-                    tabs.addTab(plot_widget, 'Plot')
-                else:
-                    tabs.addTab(canvas, 'Plot')
+            plot_widget = (build_preview_plot_widget(df, item['kind'])
+                           if item['kind'] != 'table' else None)
+            if plot_widget is not None:
+                tabs.addTab(plot_widget, 'Plot')
         except Exception:
             traceback.print_exc()  # plot failed; still show the Data tab
         tabs.addTab(make_data_table(df), 'Data')
@@ -599,10 +689,14 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         if not raw:
             box.text_view.setPlainText(state['license_info'])
             return
-        report = (summarize_lmstat(raw, box.filter_edit.text())
+        report = (summarize_lmstat(raw, box.filter_edit.text(), box.mask_check.isChecked())
                   or "Unexpected lmstat output (no 'Users of <module>' "
                      "lines):\n\n" + raw)
         box.text_view.setPlainText(f"{state['license_info']}\n\n{report}")
+
+    def on_mask_toggled(checked: bool):
+        save_mask_hosts_setting(checked)
+        render_license()
 
     def on_license_report(info: str, raw: str):
         lic_btn.setEnabled(True)
@@ -619,11 +713,18 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
                 "fnmatch pattern applied to session hostnames, e.g. '*-*' or "
                 "'impt-*'; '*' shows all hosts")
             filter_row.addWidget(box.filter_edit)
+            box.mask_check = QCheckBox("Mask hostnames")
+            box.mask_check.setToolTip(
+                "Obscure workstation names in the displayed report (filtering "
+                "above still matches the real hostname). Remembered for next start.")
+            box.mask_check.setChecked(load_mask_hosts_setting())
+            filter_row.addWidget(box.mask_check)
             box_layout.addLayout(filter_row)
             box.text_view = QPlainTextEdit()
             box.text_view.setReadOnly(True)
             box_layout.addWidget(box.text_view)
             box.filter_edit.textChanged.connect(lambda _: render_license())
+            box.mask_check.toggled.connect(on_mask_toggled)
             add_mdi_tab(box, "License usage", key)
         render_license()
         mdi.setActiveSubWindow(open_tabs[key])
@@ -656,4 +757,4 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         return None
     return {'client': state['client'], 'model': state['model'],
             'model_path': state['model_path'], 'items': result['items'],
-            'push_to_origin': result['push_to_origin']}
+            'push_to_origin': result['push_to_origin'], 'low_memory': result['low_memory']}

@@ -1,5 +1,46 @@
 # Changelog
 
+## v1.9.0 — 2026-07-02
+
+Deformation preview and large-model memory reliability release.
+
+### Fixed
+- **Large-file memory usage.** `parse_comsol_export`/`load_dataset_csv` used
+  to read the whole export/CSV as one string just to find the leading `%`
+  comment lines, peaking at several times the file size; both now stream
+  only the header block. Measured on an 18.5 MB synthetic export: peak
+  memory dropped from ~64 MB to ~32 MB.
+- Bulk extraction no longer retains every selected item's full DataFrame
+  for the whole run - only when pushing to OriginLab (where it's needed),
+  and `push_to_origin` now frees each dataset immediately after Origin has
+  taken a copy, instead of holding the entire batch until the project saves.
+
+### Added
+- **`--low-memory` / "Low memory (parse as float32)"** - parses tables and
+  plots into float32 instead of float64, halving the memory each extracted
+  dataset holds onto (precision loss below COMSOL's own exported digits).
+  Off by default; available on the CLI, the window, and threaded through
+  previews, bulk extraction, and the `--origin`-only CSV reload path.
+- Preview plots now cap what's actually drawn at ~50,000 points
+  (`subsample_for_plot`, a systematic every-Nth-row sample) for large 2D/3D
+  surfaces and line series - matplotlib chokes on far fewer points than
+  pandas does, independent of parsing memory. The Data tab and the exported
+  CSV are unaffected; only the plotted preview is thinned.
+- The deformation-exaggeration reference pass (see below) is skipped for
+  exports over 150 MB, so it can't double an already-large plot's memory use.
+- **Deformation exaggeration** — 2D/3D plot groups with an active
+  Deformation sub-feature now get a second, temp-only COMSOL export with
+  the feature switched off, recovering the undeformed reference geometry.
+  Previews of such plots gain a 0-500% exaggeration slider (default 100% =
+  COMSOL's own configured scale) that reshapes the geometry live; the
+  feature's scale factor is also recorded as a `%` comment in the export.
+- **Mask hostnames** checkbox in the license-usage tab, obscuring
+  workstation names in the displayed report (the host filter still matches
+  the real name). The setting is saved to
+  `%APPDATA%\COMSOLExtractor\settings.json` and restored on the next start.
+- The COMSOL status LED now turns green as soon as the COMSOL engine has
+  started, rather than waiting for the model to finish loading.
+
 ## v1.8.0 — 2026-07-02
 
 COMSOL-fidelity release for line/legend/3D previews and Origin plots.

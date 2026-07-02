@@ -38,7 +38,8 @@ Extract**: click **Open...** to pick the `.mph` model (a COMSOL server is
 started and the model loaded in the background), tick the items to extract,
 then click **Extract**. The window contains:
 
-- **Status** - a green LED confirming the model loaded, plus an
+- **Status** - a green LED that lights up as soon as the COMSOL engine
+  itself has started (before the model finishes loading), plus an
   **OriginLab** row showing whether Origin/OriginPro is currently running
   (LED + "running"/"not running"). A **Start OriginPro** button launches
   OriginPro (via `originpro`/COM) and re-checks its status afterwards,
@@ -57,13 +58,21 @@ then click **Extract**. The window contains:
   series; 2D/3D plots open as triangulated surfaces using the exported,
   already-deformed COMSOL coordinates when deformation is active - 3D
   previews add a **surface opacity** slider so interior detail hidden
-  behind the outer surface can be seen.
+  behind the outer surface can be seen. If the plot has an active
+  **Deformation** sub-feature, both 2D and 3D previews also get a
+  **deformation exaggeration** slider (0-500%, default 100% = COMSOL's own
+  configured scale) that reshapes the geometry live against the
+  undeformed reference captured during export.
 - **License usage** - a button in the status section runs FlexNet's
   `lmstat` (or `lmutil lmstat`, COMSOL 6.x) from the local COMSOL
   installation and opens a tab reporting which users currently hold seats
   of each COMSOL module (FNL licenses). A **Host filter** field (default
   `*-*`, an fnmatch pattern like `impt-*`; `*` shows all) narrows the
-  report to matching workstations without re-querying the server.
+  report to matching workstations without re-querying the server. A
+  **Mask hostnames** checkbox obscures workstation names in the displayed
+  report (filtering still matches the real hostname); its state is saved
+  to `%APPDATA%\COMSOLExtractor\settings.json` and restored the next time
+  the app starts.
 
 Click **Extract** to write the selected items to `<model_name>_results/`
 and, if the OriginLab checkbox is ticked, build `comsol_results.opju` in the
@@ -103,7 +112,29 @@ Other options:
   it immediately, no Open click needed)
 - `--output ./out` — custom output directory (COMSOL mode)
 - `--origin-template my_template.otpu` — Origin graph template for line plots
+- `--low-memory` — parse into float32 instead of float64, halving memory use
+  on large tables/plots (see **Large models / low on memory** below);
+  pre-ticks the same checkbox in the window
 - `--version` — print the version and exit
+
+## Large models / low on memory
+
+Large 2D/3D exports (fine meshes, long parametric sweeps) can use enough
+memory to crash the process on its own. A few things help, roughly in order
+of impact:
+
+- **Tick "Low memory (parse as float32)"** in the window (or pass
+  `--low-memory`) - halves the memory each extracted dataset holds onto,
+  for a precision loss well below what COMSOL's own text export already
+  rounds to.
+- **Extract fewer items at once** if you're selecting many large 2D/3D
+  plots together, especially with "Import extracted results into OriginLab"
+  ticked - each selected item's data is held until it's written (and, if
+  pushing to Origin, until Origin has taken a copy), so a big batch adds up.
+- Previews already cap what's actually plotted (not the underlying data) at
+  ~50,000 points for large 2D/3D/line datasets, and a plot's deformation
+  exaggeration reference pass (see below) is skipped for exports over
+  150 MB - both automatic, no configuration needed.
 
 ## Building a standalone executable
 
@@ -166,6 +197,14 @@ previously extracted folder you picked, built from its CSVs/`manifest.json`.
   from the source table's `headers` property, picked out via the plot
   feature's `xaxisdata` (x-axis column) and `plotcolumns` (y-axis column(s))
   properties.
+- 2D/3D plot groups with an active **Deformation** sub-feature (COMSOL
+  auto-tags these `defm1`, `defm2`, ...) get a second, temp-directory-only
+  export with the feature switched off, recovering the undeformed reference
+  geometry as extra `Undeformed <col>` columns alongside the (already
+  COMSOL-scaled) deformed ones - restoring the feature's active state
+  afterward either way. This is what drives the preview's deformation
+  exaggeration slider; the feature's own scale factor is also recorded as a
+  `%` comment (e.g. `Deformation: scale=87.4 (auto)`).
 - If `--origin` is given together with `--comsol`, the in-memory data is
   pushed straight into Origin via `originpro` (COM automation) — no CSV
   round-trip needed. Column long names/units and the comments are applied to

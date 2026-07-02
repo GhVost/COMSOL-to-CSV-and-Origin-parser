@@ -38,7 +38,7 @@ Code layout:
     gui.py             - PySide6 window, dialogs, and preview widgets
 """
 
-__version__ = '1.8.0'
+__version__ = '1.9.0'
 
 import argparse
 import os
@@ -90,6 +90,10 @@ def main():
                         help='Import results into OriginLab (requires originpro)')
     parser.add_argument('--origin-template', default='',
                         help='Origin graph template (.otpu) to use')
+    parser.add_argument('--low-memory', action='store_true',
+                        help='Parse data as float32 instead of float64, halving memory use '
+                             'on large tables/plots (precision loss below COMSOL\'s own '
+                             'exported digits) - pre-ticks the same option in the window')
     args = parser.parse_args()
 
     # If neither --comsol nor --origin was given, default to extracting from
@@ -118,7 +122,7 @@ def main():
         folder = folder.resolve()
 
         print(f"Loading datasets from: {folder}")
-        datasets = load_datasets_from_folder(folder)
+        datasets = load_datasets_from_folder(folder, low_memory=args.low_memory)
         if not datasets:
             sys.exit("No datasets found to import.")
 
@@ -153,7 +157,8 @@ def main():
         )
 
     # -- Combined status + item-selection window, shown immediately --
-    choice = run_extraction_window(model_path, comsol_warning, do_origin)
+    choice = run_extraction_window(model_path, comsol_warning, do_origin,
+                                    low_memory_default=args.low_memory)
     if choice is None:
         print("Nothing selected. Exiting.")
         return
@@ -164,6 +169,7 @@ def main():
         return
     selected = choice['items']
     do_origin = choice['push_to_origin']
+    low_memory = choice['low_memory']
     model_path = choice['model_path']
 
     # -- Output folder: same location as .mph, named <stem>_results --
@@ -190,7 +196,12 @@ def main():
         '3d_plots': [],
         'other': [],
     }
-    datasets = []  # collected for direct OriginLab export: {'name', 'kind', 'df'}
+    # Collected for direct OriginLab export ({'name', 'kind', 'df', 'comments'}
+    # per item) - only kept when actually needed, since holding every
+    # extracted item's full DataFrame for the whole run (on top of the one
+    # currently being extracted) is itself a common cause of running out of
+    # memory on a large model with many selected items.
+    datasets = [] if do_origin else None
 
     # ---- Extract selected items ----
     for item in selected:
@@ -198,7 +209,7 @@ def main():
 
         if kind == 'table':
             print(f"  - {tag} ({label})")
-            result = extract_table(model, tag)
+            result = extract_table(model, tag, low_memory=low_memory)
             if result is not None and not result[0].empty:
                 df, comments = result
                 comments = comments + [date_stamp]
@@ -208,7 +219,8 @@ def main():
                 manifest['tables'].append({'tag': tag, 'label': label, 'file': fname,
                                            'rows': len(df), 'cols': list(df.columns),
                                            'comments': comments})
-                datasets.append({'name': name, 'kind': 'table', 'df': df, 'comments': comments})
+                if datasets is not None:
+                    datasets.append({'name': name, 'kind': 'table', 'df': df, 'comments': comments})
                 print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
             continue
 
@@ -218,7 +230,7 @@ def main():
         pg, class_name, ptype = item['pg'], item['class_name'], kind
         print(f"\n  [{ptype.upper():>7}] {tag} ({label})  [{class_name}]")
 
-        result = extract_via_export(model, pg, tag, output_dir)
+        result = extract_via_export(model, pg, tag, output_dir, kind=ptype, low_memory=low_memory)
         if result is not None and not result[0].empty:
             df, comments = result
 
@@ -242,7 +254,8 @@ def main():
                 # Java class name for diagnostics.
                 entry['type'] = class_name
                 manifest['other'].append(entry)
-            datasets.append({'name': name, 'kind': ptype, 'df': df, 'comments': comments})
+            if datasets is not None:
+                datasets.append({'name': name, 'kind': ptype, 'df': df, 'comments': comments})
             print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
         else:
             # Export/parse failed (e.g. empty plot, unsupported export) -

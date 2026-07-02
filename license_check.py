@@ -7,8 +7,40 @@ per-module usage report filterable by host pattern.
 import os
 import re
 import fnmatch
+import json
 import subprocess
 from pathlib import Path
+
+# Small persisted settings file (just the "mask hostnames" checkbox state)
+# so the license report starts in the same mode it was left in.
+SETTINGS_PATH = Path(os.environ.get('APPDATA', str(Path.home()))) / 'COMSOLExtractor' / 'settings.json'
+
+
+def load_mask_hosts_setting() -> bool:
+    """Return the last saved 'mask hostnames' preference (default False)."""
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding='utf-8'))
+        return bool(data.get('mask_hosts', False))
+    except Exception:
+        return False
+
+
+def save_mask_hosts_setting(value: bool):
+    """Persist the 'mask hostnames' preference for the next start."""
+    try:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATH.write_text(json.dumps({'mask_hosts': bool(value)}), encoding='utf-8')
+    except Exception:
+        pass  # best-effort; a failed save just falls back to the default next run
+
+
+def mask_hostname(host: str) -> str:
+    """Partially obscure a workstation hostname for display - keep a short
+    prefix so repeated entries stay distinguishable without showing the
+    full, identifiable name."""
+    if len(host) <= 2:
+        return '*' * len(host)
+    return host[:2] + '*' * (len(host) - 2)
 
 
 def find_lmstat() -> tuple[list[str], Path] | None:
@@ -39,13 +71,15 @@ def find_lmstat() -> tuple[list[str], Path] | None:
     return None
 
 
-def summarize_lmstat(text: str, host_filter: str = '*') -> str:
+def summarize_lmstat(text: str, host_filter: str = '*', mask_hosts: bool = False) -> str:
     """Condense `lmstat -a` output into one line per checked-out COMSOL
     module plus the user@host sessions holding each seat, keeping only
     sessions whose host matches host_filter (an fnmatch pattern, e.g. '*-*'
-    or 'impt-*'; '*' keeps everything). Returns '' if the output contains no
-    'Users of <module>' lines at all (so the caller can fall back to showing
-    the raw output)."""
+    or 'impt-*'; '*' keeps everything). Filtering always matches the real
+    hostname; mask_hosts only affects the displayed text (see
+    mask_hostname()). Returns '' if the output contains no 'Users of
+    <module>' lines at all (so the caller can fall back to showing the raw
+    output)."""
     pattern = (host_filter or '*').strip() or '*'
     blocks = []    # (header line, [(user, host, since), ...]) per in-use module
     sessions = None  # session list of the current in-use module, if any
@@ -89,7 +123,8 @@ def summarize_lmstat(text: str, host_filter: str = '*') -> str:
         # an in-use module never disappears silently.
         if shown or not sess:
             lines_out.append(header)
-            lines_out += [f"    {user} on {host}  (since {since})"
+            lines_out += [f"    {user} on {mask_hostname(host) if mask_hosts else host}"
+                          f"  (since {since})"
                           for user, host, since in shown]
     if not lines_out:
         return f"No COMSOL modules are checked out by hosts matching '{pattern}'."
