@@ -21,10 +21,10 @@ python -m venv .venv
 .venv\Scripts\python install_requirements.py
 ```
 
-`install_requirements.py` installs everything listed in `requirements.txt`
-(`MPh`, `pandas`, `numpy`, `psutil`, `PySide6`, `matplotlib`, and the
-optional `originpro`). It can
-also be run directly with `pip install -r requirements.txt` if preferred.
+`install_requirements.py` installs the required packages from
+`requirements.txt` and then attempts the optional Origin/build tooling from
+`requirements-origin.txt` and `requirements-dev.txt`. A COMSOL-only setup can
+also be installed directly with `pip install -r requirements.txt`.
 
 ## Usage
 
@@ -51,8 +51,13 @@ then click **Extract**. The window contains:
 - **Items to extract** - a checklist of tables/plot groups, grouped by type
   (Tables / 1D / 2D / 3D Plots), all checked by default. **Clicking** an
   item extracts it once and opens a preview tab in the MDI area on the
-  right, with a **Plot** view (line chart for tables/1D plots,
-  value-colored scatter for 2D/3D) and a **Data** grid.
+  right. Tables open as a **Data** grid only; 1D plots open as separate
+  line series (no markers on the line itself) with legend entries taken
+  from COMSOL's own curve labels where available, plus a peak marker per
+  series; 2D/3D plots open as triangulated surfaces using the exported,
+  already-deformed COMSOL coordinates when deformation is active - 3D
+  previews add a **surface opacity** slider so interior detail hidden
+  behind the outer surface can be seen.
 - **License usage** - a button in the status section runs FlexNet's
   `lmstat` (or `lmutil lmstat`, COMSOL 6.x) from the local COMSOL
   installation and opens a tab reporting which users currently hold seats
@@ -164,7 +169,11 @@ previously extracted folder you picked, built from its CSVs/`manifest.json`.
 - If `--origin` is given together with `--comsol`, the in-memory data is
   pushed straight into Origin via `originpro` (COM automation) — no CSV
   round-trip needed. Column long names/units and the comments are applied to
-  each worksheet.
+  each worksheet. Parametric line sweeps exported as stitched x/y pairs are
+  split into separate **line-only** Origin series (no symbols) with legend
+  entries taken from COMSOL's own curve labels where available, so the
+  graph matches COMSOL's plot instead of drawing connector zigzags between
+  parameter values.
 - If `--origin` is given without `--comsol`, the same `push_to_origin()` step
   runs on data read back from a `<model_name>_results/` folder's CSVs and
   `manifest.json` (via `load_dataset_csv()`/`load_datasets_from_folder()`),

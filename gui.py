@@ -11,7 +11,6 @@ import traceback
 from pathlib import Path
 
 import pandas as pd
-import mph
 
 try:
     from PySide6.QtCore import QObject, Qt, QTimer, Signal
@@ -19,8 +18,8 @@ try:
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
         QLineEdit, QListWidget, QListWidgetItem, QMdiArea, QPlainTextEdit,
-        QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
-        QVBoxLayout, QWidget,
+        QPushButton, QSlider, QSplitter, QTableWidget, QTableWidgetItem,
+        QTabWidget, QVBoxLayout, QWidget,
     )
 except ImportError:
     sys.exit(
@@ -28,7 +27,10 @@ except ImportError:
         "  pip install PySide6"
     )
 
-from extraction import discover_items, extract_table, extract_via_export
+from extraction import (
+    discover_items, extract_table, extract_via_export, legend_label_from_column,
+    line_markers, line_series_dataframe, surface_columns,
+)
 from license_check import query_license_usage, summarize_lmstat
 from origin_push import origin_already_running, start_originpro
 
@@ -59,47 +61,74 @@ def pick_folder_dialog(title: str) -> Path | None:
 # colorblind-safe; validated for CVD separation on a light surface).
 PREVIEW_LINE_COLORS = ['#0072B2', '#E69F00', '#009E73', '#CC79A7', '#D55E00', '#56B4E9']
 
-PREVIEW_MAX_ROWS = 2000  # ponytail: Data tab caps preview rows; the CSV has the full data
+PREVIEW_MAX_ROWS = 2000  # Data tab caps preview rows; the CSV has the full data
 
 
-def make_preview_figure(df: pd.DataFrame, kind: str):
-    """Build a matplotlib Figure previewing a dataset: a line chart of each Y
-    vs the first column for tables/1D plots, a value-colored scatter
-    (viridis) for 2D/3D. Returns None if matplotlib is unavailable or the
-    data has fewer than two numeric columns."""
+def make_preview_figure(df: pd.DataFrame, kind: str, surface_alpha: float = 0.78):
+    """Build a matplotlib Figure previewing a dataset.
+
+    Tables are intentionally not plotted. 1D data is drawn as separate line
+    series with peak markers. 2D/3D data is rendered as a triangulated
+    surface so COMSOL deformation coordinates remain visible.
+    """
     try:
         from matplotlib.figure import Figure
     except ImportError:
         return None
 
+    if kind == 'table':
+        return None
+
     num = df.select_dtypes('number')
     if num.shape[1] < 2:
         return None
-    cols = num.columns
 
     fig = Figure(figsize=(5, 4), layout='tight')
-    if kind == '3d' and num.shape[1] >= 3:
+    surface = surface_columns(df, kind)
+    if kind == '3d' and surface:
+        x_col, y_col, z_col, value_col = surface
         ax = fig.add_subplot(projection='3d')
-        value_col = cols[3] if num.shape[1] > 3 else cols[2]
-        pts = ax.scatter(num[cols[0]], num[cols[1]], num[cols[2]],
-                         c=num[value_col], s=4, cmap='viridis')
-        fig.colorbar(pts, ax=ax, label=str(value_col), shrink=0.7)
-        ax.set_xlabel(str(cols[0]))
-        ax.set_ylabel(str(cols[1]))
-        ax.set_zlabel(str(cols[2]))
-    elif kind == '2d' and num.shape[1] >= 3:
+        if value_col and value_col != z_col:
+            surf = ax.plot_trisurf(num[x_col], num[y_col], num[z_col],
+                                   cmap='viridis', linewidth=0.1,
+                                   antialiased=True, shade=True,
+                                   alpha=surface_alpha)
+            surf.set_array(num[value_col].to_numpy())
+            surf.autoscale()
+            fig.colorbar(surf, ax=ax, label=str(value_col), shrink=0.7)
+        else:
+            surf = ax.plot_trisurf(num[x_col], num[y_col], num[z_col],
+                                   cmap='viridis', linewidth=0.1,
+                                   antialiased=True, alpha=surface_alpha)
+            fig.colorbar(surf, ax=ax, label=str(z_col), shrink=0.7)
+        ax.set_xlabel(str(x_col))
+        ax.set_ylabel(str(y_col))
+        ax.set_zlabel(str(z_col))
+    elif kind == '2d' and surface:
+        x_col, y_col, value_col, _ = surface
         ax = fig.add_subplot()
-        pts = ax.scatter(num[cols[0]], num[cols[1]], c=num[cols[2]],
-                         s=4, cmap='viridis')
-        fig.colorbar(pts, ax=ax, label=str(cols[2]))
-        ax.set_xlabel(str(cols[0]))
-        ax.set_ylabel(str(cols[1]))
+        filled = ax.tricontourf(num[x_col], num[y_col], num[value_col],
+                                levels=32, cmap='viridis')
+        ax.tricontour(num[x_col], num[y_col], num[value_col],
+                      levels=12, colors='k', linewidths=0.25, alpha=0.35)
+        fig.colorbar(filled, ax=ax, label=str(value_col))
+        ax.set_xlabel(str(x_col))
+        ax.set_ylabel(str(y_col))
         ax.set_aspect('equal', adjustable='datalim')
     else:
+        num = line_series_dataframe(df).select_dtypes('number')
+        cols = num.columns
+        if num.shape[1] < 2:
+            return None
         ax = fig.add_subplot()
         ax.set_prop_cycle(color=PREVIEW_LINE_COLORS)
         for col in cols[1:]:
-            ax.plot(num[cols[0]], num[col], lw=1.5, label=str(col))
+            ax.plot(num[cols[0]], num[col], lw=1.5,
+                    label=legend_label_from_column(str(col)), marker='')
+        for marker in line_markers(num):
+            ax.plot(marker['x'], marker['y'], marker='o', ms=4, color='black')
+            ax.annotate(f"{marker['y']:.3g}", (marker['x'], marker['y']),
+                        textcoords='offset points', xytext=(4, 4), fontsize=8)
         ax.set_xlabel(str(cols[0]))
         if num.shape[1] == 2:
             ax.set_ylabel(str(cols[1]))  # single series: axis label, no legend
@@ -285,6 +314,7 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
     check_items: list[QListWidgetItem] = []
     state = {'client': None, 'model': None, 'model_path': model_path,
              'items': [], 'cancelled': False, 'previewing': False,
+             'pending_preview': None,
              'worker_start': time.monotonic(), 'lmstat_raw': '',
              'license_info': '', 'status_text': ''}
     result = {'items': None, 'push_to_origin': False}
@@ -362,6 +392,12 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
             client = state['client']
             if client is None:
                 signals.status.emit("Starting COMSOL server...")
+                try:
+                    import mph
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "MPh is not installed. Install it with: pip install MPh"
+                    ) from exc
                 client = mph.start()
                 # Store the client as soon as it exists so the cancel path
                 # below can shut it down even if the window closes mid-load.
@@ -448,18 +484,26 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         sub.destroyed.connect(lambda *_, k=key: open_tabs.pop(k, None))
         open_tabs[key] = sub
         sub.show()
+        mdi.setActiveSubWindow(sub)
+
+    def preview_key(item: dict) -> str:
+        return f"{item['kind']}:{item['tag']}"
 
     def request_preview(entry):
         if entry is None or entry not in check_items:
             return  # nothing selected, or a group heading
         item = state['items'][check_items.index(entry)]
         tag = item['tag']
-        if tag in open_tabs:
-            mdi.setActiveSubWindow(open_tabs[tag])
+        key = preview_key(item)
+        if key in open_tabs:
+            mdi.setActiveSubWindow(open_tabs[key])
             return
         if state['previewing']:
+            state['pending_preview'] = entry
+            status_bar.setText(f"Queued preview of '{tag}'...")
             return  # one preview extraction at a time; COMSOL calls don't overlap
         state['previewing'] = True
+        state['pending_preview'] = None
         status_bar.setText(f"Extracting preview of '{tag}'...")
 
         def preview_worker():
@@ -481,20 +525,60 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         if data is None or data[0].empty:
             status_bar.setText(f"Preview of '{item['tag']}' failed - no data "
                                "extracted (details in the console output).")
+            pending = state.get('pending_preview')
+            if pending is not None:
+                state['pending_preview'] = None
+                request_preview(pending)
             return
         df = data[0]
         tabs = QTabWidget()
         try:
-            fig = make_preview_figure(df, item['kind'])
+            if item['kind'] != 'table':
+                fig = make_preview_figure(df, item['kind'])
+            else:
+                fig = None
             if fig is not None:
                 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-                tabs.addTab(FigureCanvasQTAgg(fig), 'Plot')
+                canvas = FigureCanvasQTAgg(fig)
+                if item['kind'] == '3d':
+                    plot_widget = QWidget()
+                    plot_layout = QVBoxLayout(plot_widget)
+                    plot_layout.setContentsMargins(0, 0, 0, 0)
+                    plot_layout.addWidget(canvas, 1)
+
+                    slider_row = QHBoxLayout()
+                    slider_row.addWidget(QLabel("Surface opacity:"))
+                    alpha_slider = QSlider(Qt.Orientation.Horizontal)
+                    alpha_slider.setRange(15, 100)
+                    alpha_slider.setValue(78)
+                    alpha_value = QLabel("78%")
+                    slider_row.addWidget(alpha_slider, 1)
+                    slider_row.addWidget(alpha_value)
+                    plot_layout.addLayout(slider_row)
+
+                    def update_surface_alpha(value: int, fig=fig, canvas=canvas,
+                                             label=alpha_value):
+                        alpha = value / 100
+                        label.setText(f"{value}%")
+                        for ax in fig.axes:
+                            for collection in ax.collections:
+                                collection.set_alpha(alpha)
+                        canvas.draw_idle()
+
+                    alpha_slider.valueChanged.connect(update_surface_alpha)
+                    tabs.addTab(plot_widget, 'Plot')
+                else:
+                    tabs.addTab(canvas, 'Plot')
         except Exception:
             traceback.print_exc()  # plot failed; still show the Data tab
         tabs.addTab(make_data_table(df), 'Data')
-        add_mdi_tab(tabs, f"{item['tag']}: {item['label']}", item['tag'])
+        add_mdi_tab(tabs, f"{item['tag']}: {item['label']}", preview_key(item))
         status_bar.setText(f"Preview ready: {item['tag']} "
                            f"({len(df)} rows x {len(df.columns)} cols)")
+        pending = state.get('pending_preview')
+        if pending is not None:
+            state['pending_preview'] = None
+            request_preview(pending)
 
     item_list.itemClicked.connect(request_preview)
     signals.preview.connect(on_preview)

@@ -38,7 +38,7 @@ Code layout:
     gui.py             - PySide6 window, dialogs, and preview widgets
 """
 
-__version__ = '1.7.0'
+__version__ = '1.8.0'
 
 import argparse
 import os
@@ -255,8 +255,8 @@ def main():
 
     # -- Write manifest --
     manifest_path = output_dir / 'manifest.json'
-    with open(manifest_path, 'w') as f:
-        json.dump(manifest, f, indent=2)
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
     print(f"\nManifest written: {manifest_path}")
 
     # -- Summary --

@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.8.0 — 2026-07-02
+
+COMSOL-fidelity release for line/legend/3D previews and Origin plots.
+
+### Added
+- **Adjustable 3D surface opacity** — a slider (15–100%) on 3D previews
+  live-updates the surface's transparency, so interior detail behind the
+  outer surface is no longer hidden.
+- **`tests/`** — pytest suite covering the CSV round-trip, header/legend
+  parsing, and line-sweep splitting; `pyproject.toml` adds pytest/ruff
+  config.
+- `requirements-origin.txt` / `requirements-dev.txt` split out of
+  `requirements.txt` (Origin and dev/build tooling installed as optional
+  sets by `install_requirements.py`).
+
+### Changed
+- **Legend replication** — curve legends in both the preview and the
+  Origin worksheet now come from COMSOL's own legend text where available
+  (`get_plot_legend_labels`), falling back to the curve-label suffix
+  encoded in COMSOL's column headers (e.g. `Iout (mA), V_dc=1 V`).
+- **Line-only Origin import** — imported line series (tables/1D plots) are
+  added to the Origin graph as **line only** (no symbols), matching
+  COMSOL's own line plots instead of Origin's default line+symbol style;
+  the legend is rebuilt from the corrected series names.
+- Parametric line sweeps exported as one stitched x/y pair are split into
+  separate series (preview and Origin alike) using COMSOL's legend text
+  for naming instead of generic `y1`/`y2`.
+
 ## v1.7.0 — 2026-07-02
 
 Workflow and license-monitoring release.

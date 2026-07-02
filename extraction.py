@@ -6,7 +6,7 @@ and re-load extracted datasets.
 
 import re
 import csv
-import sys
+import json
 import shutil
 import tempfile
 from pathlib import Path
@@ -19,14 +19,7 @@ try:
 except ImportError:
     psutil = None
 
-try:
-    import mph
-except ImportError:
-    sys.exit(
-        "ERROR: MPh not installed.\n"
-        "  pip install MPh\n"
-        "Also ensure COMSOL Multiphysics is installed and licensed."
-    )
+LEGEND_LABELS_COMMENT = "Legend labels:"
 
 
 def sanitize_filename(name: str) -> str:
@@ -58,6 +51,48 @@ def split_label_unit(label: str) -> tuple[str, str]:
     return name.strip(' ,'), m.group(1).strip()
 
 
+def legend_label_from_column(label: str) -> str:
+    """Return the curve legend text encoded in a COMSOL-style column header.
+
+    COMSOL multi-curve exports commonly use headers such as
+    ``Iout (mA), V_dc=1 V``. The measured quantity and unit belong on the
+    worksheet/axis, while the suffix after the comma is the legend entry.
+    """
+    name, _unit = split_label_unit(label)
+    parts = [part.strip() for part in name.split(',') if part.strip()]
+    return parts[-1] if len(parts) > 1 else name
+
+
+def legend_labels_comment(labels: list[str]) -> str:
+    """Encode legend labels into a CSV comment line."""
+    return f"{LEGEND_LABELS_COMMENT} {json.dumps(labels, ensure_ascii=False)}"
+
+
+def extract_legend_labels_from_comments(comments: list[str]) -> tuple[list[str], list[str]]:
+    """Return (legend labels, comments without the internal legend line)."""
+    labels = []
+    kept = []
+    for comment in comments:
+        if comment.startswith(LEGEND_LABELS_COMMENT):
+            raw = comment[len(LEGEND_LABELS_COMMENT):].strip()
+            try:
+                values = json.loads(raw)
+            except json.JSONDecodeError:
+                values = []
+            if isinstance(values, list):
+                labels = [str(value) for value in values if str(value).strip()]
+            continue
+        kept.append(comment)
+    return labels, kept
+
+
+def set_legend_labels(df: pd.DataFrame, labels: list[str] | None):
+    """Attach non-empty legend labels to a DataFrame."""
+    clean = [str(label).strip() for label in labels or [] if str(label).strip()]
+    if clean:
+        df.attrs['legend_labels'] = clean
+
+
 def repair_mojibake(text: str) -> str:
     """Fix text COMSOL's export wrote as UTF-8 bytes re-interpreted as
     Windows-1252 (e.g. the unit 'µm' coming out as 'Âµm')."""
@@ -75,6 +110,8 @@ def write_csv_with_comments(df: pd.DataFrame, path: Path, comments: list[str] | 
     with open(path, 'w', encoding='utf-8', newline='') as f:
         for line in comments or []:
             f.write(f"% {line}\n")
+        if df.attrs.get('legend_labels'):
+            f.write(f"% {legend_labels_comment(df.attrs['legend_labels'])}\n")
         writer = csv.writer(f)
         writer.writerow(names)
         writer.writerow(units)
@@ -97,12 +134,131 @@ def load_dataset_csv(path: Path) -> tuple[pd.DataFrame, list[str]]:
         comments.append(lines[i][1:].strip())
         i += 1
 
+    labels, comments = extract_legend_labels_from_comments(comments)
+
     names = next(csv.reader([lines[i]]))
     units = next(csv.reader([lines[i + 1]]))
     headers = [f"{name} ({unit})" if unit else name for name, unit in zip(names, units)]
 
     df = pd.read_csv(path, skiprows=i + 2, header=None, names=headers)
+    set_legend_labels(df, labels)
     return df, comments
+
+
+def is_monotonic_series(values: pd.Series) -> bool:
+    """Return True when values are consistently nondecreasing/nonincreasing."""
+    clean = pd.to_numeric(values, errors='coerce').dropna()
+    if len(clean) < 3:
+        return True
+    diffs = clean.diff().dropna()
+    diffs = diffs[diffs != 0]
+    if diffs.empty:
+        return True
+    return bool((diffs >= 0).all() or (diffs <= 0).all())
+
+
+def split_line_segments(df: pd.DataFrame) -> list[pd.DataFrame]:
+    """Split a two-column line export into repeated x-sweeps.
+
+    COMSOL sometimes exports parametric line plots as one long x/y pair:
+    sweep 1, then sweep 2, then sweep 3, and so on. Plotting that directly
+    connects the last point of one sweep to the first point of the next,
+    creating the visible zigzag. Break the data where the x direction
+    reverses or jumps back to the start of the next sweep.
+    """
+    num = df.select_dtypes('number')
+    if num.shape[1] != 2 or len(num) < 4:
+        return [df]
+
+    x = num.iloc[:, 0].reset_index(drop=True)
+    diffs = x.diff()
+    nonzero = diffs[diffs != 0].dropna()
+    if nonzero.empty:
+        return [df]
+
+    direction = 1 if (nonzero > 0).sum() >= (nonzero < 0).sum() else -1
+    breaks = [0]
+    for idx, diff in diffs.items():
+        if idx == 0 or pd.isna(diff) or diff == 0:
+            continue
+        if diff * direction < 0:
+            breaks.append(idx)
+    breaks.append(len(df))
+
+    segments = [df.iloc[start:end].reset_index(drop=True)
+                for start, end in zip(breaks, breaks[1:]) if end > start]
+    return segments or [df]
+
+
+def line_series_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a wide line-series frame suitable for plotting/export.
+
+    Existing wide data is kept as-is. Long data with explicit x/y/group
+    columns is pivoted by group. Two-column concatenated sweeps are split
+    into one y column per sweep, preventing cross-sweep connector lines.
+    """
+    if 'group' in df.columns and {'x', 'y'}.issubset(df.columns):
+        wide = df.pivot_table(index='x', columns='group', values='y', sort=False).reset_index()
+        wide.columns = ['x'] + [str(c) for c in wide.columns[1:]]
+        return wide
+
+    num = df.select_dtypes('number')
+    if num.shape[1] != 2:
+        return df
+
+    segments = split_line_segments(num)
+    if len(segments) <= 1:
+        return df
+
+    x_col, y_col = num.columns[:2]
+    y_name, y_unit = split_label_unit(y_col)
+    labels = df.attrs.get('legend_labels') or []
+    wide = None
+    for index, segment in enumerate(segments, start=1):
+        part = segment[[x_col, y_col]].copy()
+        series_name = labels[index - 1] if index <= len(labels) else f"{y_name} {index}"
+        if y_unit:
+            series_name = f"{series_name} ({y_unit})"
+        part.columns = [x_col, series_name]
+        wide = part if wide is None else wide.merge(part, on=x_col, how='outer')
+    return wide.sort_values(by=x_col).reset_index(drop=True)
+
+
+def line_markers(df: pd.DataFrame) -> list[dict]:
+    """Return peak markers for each y series in a line-series DataFrame."""
+    num = df.select_dtypes('number')
+    if num.shape[1] < 2:
+        return []
+    x_col = num.columns[0]
+    markers = []
+    for y_col in num.columns[1:]:
+        series = num[y_col].dropna()
+        if series.empty:
+            continue
+        idx = series.idxmax()
+        markers.append({
+            'x_col': x_col,
+            'y_col': y_col,
+            'x': float(num.loc[idx, x_col]),
+            'y': float(num.loc[idx, y_col]),
+        })
+    return markers
+
+
+def surface_columns(df: pd.DataFrame, kind: str) -> tuple[str, str, str, str | None] | None:
+    """Pick coordinate/value columns for 2D/3D surface previews.
+
+    COMSOL plot exports normally write deformed plot coordinates when a
+    Deformation feature is active, so using the exported coordinate columns
+    preserves the displayed shape without recomputing displacement here.
+    """
+    num = df.select_dtypes('number')
+    if kind == '2d' and num.shape[1] >= 3:
+        return num.columns[0], num.columns[1], num.columns[2], None
+    if kind == '3d' and num.shape[1] >= 3:
+        value_col = num.columns[3] if num.shape[1] > 3 else num.columns[2]
+        return num.columns[0], num.columns[1], num.columns[2], value_col
+    return None
 
 
 def comsol_already_running() -> bool:
@@ -419,6 +575,68 @@ def get_table_graph_headers(model, pg) -> list[str] | None:
     return None
 
 
+def get_plot_legend_labels(pg) -> list[str]:
+    """Best-effort read of explicit legend labels from a COMSOL plot group.
+
+    COMSOL stores legend text on different properties depending on plot
+    feature type/version. Walk plot features recursively and keep plausible
+    string-array properties whose names mention legend.
+    """
+    labels = []
+
+    def plausible(values: list[str]) -> bool:
+        clean = [value.strip() for value in values if value.strip()]
+        if len(clean) < 2:
+            return False
+        lowered = {value.lower() for value in clean}
+        return not lowered <= {'on', 'off', 'auto', 'manual', 'true', 'false'}
+
+    def visit(feat):
+        nonlocal labels
+        if labels:
+            return
+        try:
+            names = {str(n) for n in feat.properties()}
+        except Exception:
+            names = set()
+
+        for prop in names:
+            if 'legend' not in prop.lower():
+                continue
+            try:
+                value_type = str(feat.getValueType(prop))
+            except Exception:
+                continue
+            try:
+                if value_type == 'StringArray':
+                    values = [str(value).strip() for value in feat.getStringArray(prop)]
+                elif value_type == 'String':
+                    raw = str(feat.getString(prop)).strip()
+                    values = re.split(r'\s*[,;]\s*', raw) if raw else []
+                else:
+                    continue
+            except Exception:
+                continue
+            if plausible(values):
+                labels = [value for value in values if value.strip()]
+                return
+
+        try:
+            for ctag in feat.feature().tags():
+                visit(feat.feature(str(ctag)))
+        except Exception:
+            pass
+
+    try:
+        for ftag in pg.feature().tags():
+            visit(pg.feature(str(ftag)))
+            if labels:
+                break
+    except Exception:
+        pass
+    return labels
+
+
 def parse_comsol_export(path: Path, units_map: dict[str, str] | None = None,
                          coordinate_unit: str = '',
                          fallback_headers: list[str] | None = None) -> tuple[pd.DataFrame, list[str]] | None:
@@ -488,8 +706,16 @@ def extract_via_export(model, pg, pg_tag: str, output_dir: Path) -> tuple[pd.Dat
         return None
 
     try:
-        return parse_comsol_export(export_path, get_feature_units(pg), get_geometry_length_unit(model, pg),
-                                    get_table_graph_headers(model, pg))
+        result = parse_comsol_export(export_path, get_feature_units(pg), get_geometry_length_unit(model, pg),
+                                     get_table_graph_headers(model, pg))
+        if result is None:
+            return None
+        df, comments = result
+        segments = split_line_segments(df)
+        labels = get_plot_legend_labels(pg)
+        if len(labels) == len(segments):
+            set_legend_labels(df, labels)
+        return df, comments
     except Exception as e:
         print(f"  [!] Could not parse export for '{pg_tag}': {e}")
         return None

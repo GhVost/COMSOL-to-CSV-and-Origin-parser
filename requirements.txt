@@ -4,12 +4,3 @@ numpy
 psutil
 PySide6
 matplotlib
-
-# Optional - only needed for --origin (requires OriginLab to be installed
-# on this machine to actually use it, but the package itself installs fine
-# without it).
-originpro
-
-# Optional - only needed to build a standalone .exe with build_exe.py /
-# COMSOLExtractor.spec.
-pyinstaller

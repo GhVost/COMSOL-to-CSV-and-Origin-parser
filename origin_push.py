@@ -17,7 +17,10 @@ try:
 except ImportError:
     psutil = None
 
-from extraction import load_dataset_csv, split_label_unit
+from extraction import (
+    legend_label_from_column, line_series_dataframe, load_dataset_csv,
+    split_label_unit,
+)
 
 
 def origin_already_running() -> bool:
@@ -147,11 +150,12 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = '') -> Path
             name, kind, df = entry['name'], entry['kind'], entry['df']
             comments = entry.get('comments') or []
 
-            # Long-format (x, y, group) multi-curve data -> wide format (one
-            # y column per group) for proper multi-curve plotting.
-            if 'group' in df.columns and {'x', 'y'}.issubset(df.columns):
-                df = df.pivot_table(index='x', columns='group', values='y', sort=False).reset_index()
-                df.columns = ['x'] + [str(c) for c in df.columns[1:]]
+            # Parametric line sweeps can arrive as one stitched x/y curve.
+            # Convert them to wide series before writing to Origin so the
+            # graph gets independent curves, a real legend, and no connector
+            # line between parameter values.
+            if kind in ('table', '1d'):
+                df = line_series_dataframe(df)
 
             wb = op.new_book('w', name)
             sheet = wb[0]
@@ -163,6 +167,8 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = '') -> Path
             # Origin's long name / units label rows.
             for i, col in enumerate(df.columns):
                 label, unit = split_label_unit(col)
+                if i > 0 and kind in ('table', '1d'):
+                    label = legend_label_from_column(col)
                 sheet.set_label(i, label, type='L')
                 if unit:
                     sheet.set_label(i, unit, type='U')
@@ -178,7 +184,12 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = '') -> Path
                 graph = op.new_graph(template=template) if template else op.new_graph()
                 layer = graph[0]
                 for i in range(1, len(df.columns)):
-                    layer.add_plot(sheet, coly=i, colx=0)
+                    layer.add_plot(sheet, coly=i, colx=0, type='l')
+                try:
+                    layer.group(True)
+                    layer.LT_execute('legend -r')
+                except Exception:
+                    pass
                 layer.rescale()
                 graph.lname = name
 
