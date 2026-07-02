@@ -2,6 +2,8 @@ MPh
 pandas
 numpy
 psutil
+PySide6
+matplotlib
 
 # Optional - only needed for --origin (requires OriginLab to be installed
 # on this machine to actually use it, but the package itself installs fine

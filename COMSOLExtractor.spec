@@ -5,7 +5,7 @@
 #
 # COMSOL Multiphysics and/or OriginLab must still be installed and licensed
 # on the machine running the resulting .exe - this only bundles the Python
-# side (MPh/JPype, pandas, originpro, tkinter, ...).
+# side (MPh/JPype, pandas, originpro, PySide6, ...).
 
 from pathlib import Path
 import mph
@@ -23,7 +23,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['tkinter'],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

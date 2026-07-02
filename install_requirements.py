@@ -6,9 +6,9 @@ Usage:
 
 Installs into whichever Python environment runs this script (e.g. activate
 a virtual environment first if you want one). Installs everything listed in
-requirements.txt - MPh, pandas, numpy, psutil (required), and originpro and
-pyinstaller (optional, for --origin and for building a standalone .exe
-respectively). If an optional package fails to install, this is reported as
+requirements.txt - MPh, pandas, numpy, psutil, PySide6, matplotlib
+(required), and originpro and pyinstaller (optional, for --origin and for
+building a standalone .exe respectively). If an optional package fails to install, this is reported as
 a warning rather than an error, since --comsol-only use doesn't need either.
 """
 

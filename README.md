@@ -10,7 +10,8 @@ OriginLab without COMSOL at all.
 - COMSOL Multiphysics (5.x or 6.x), installed and licensed — only needed for
   `--comsol`
 - Python 3.10+
-- Python packages: `MPh`, `pandas`, `numpy`, `psutil`
+- Python packages: `MPh`, `pandas`, `numpy`, `psutil`, `PySide6` (GUI),
+  `matplotlib` (preview plots)
 - Optional, for `--origin`: OriginLab installed + `originpro`
 
 Install everything into a virtual environment:
@@ -21,7 +22,8 @@ python -m venv .venv
 ```
 
 `install_requirements.py` installs everything listed in `requirements.txt`
-(`MPh`, `pandas`, `numpy`, `psutil`, and the optional `originpro`). It can
+(`MPh`, `pandas`, `numpy`, `psutil`, `PySide6`, `matplotlib`, and the
+optional `originpro`). It can
 also be run directly with `pip install -r requirements.txt` if preferred.
 
 ## Usage
@@ -30,9 +32,11 @@ also be run directly with `pip install -r requirements.txt` if preferred.
 .venv\Scripts\python.exe COMSOLExtractor.py
 ```
 
-With no `--comsol`/`--origin` flags, the script opens a file picker for the
-`.mph` model, starts a COMSOL server and loads it, then shows a single
-combined window with:
+With no `--comsol`/`--origin` flags, the script opens a single combined
+window. The buttons follow the work sequence **Open >> Select/Deselect >>
+Extract**: click **Open...** to pick the `.mph` model (a COMSOL server is
+started and the model loaded in the background), tick the items to extract,
+then click **Extract**. The window contains:
 
 - **Status** - a green LED confirming the model loaded, plus an
   **OriginLab** row showing whether Origin/OriginPro is currently running
@@ -44,13 +48,24 @@ combined window with:
   If a COMSOL process was already running before this session started, a
   warning is shown here too (an extra engine instance/license seat will be
   used).
-- **Items to extract** - the same checklist of tables/plot groups as
-  before, grouped by type (Tables / 1D / 2D / 3D Plots), all checked by
-  default.
+- **Items to extract** - a checklist of tables/plot groups, grouped by type
+  (Tables / 1D / 2D / 3D Plots), all checked by default. **Clicking** an
+  item extracts it once and opens a preview tab in the MDI area on the
+  right, with a **Plot** view (line chart for tables/1D plots,
+  value-colored scatter for 2D/3D) and a **Data** grid.
+- **License usage** - a button in the status section runs FlexNet's
+  `lmstat` (or `lmutil lmstat`, COMSOL 6.x) from the local COMSOL
+  installation and opens a tab reporting which users currently hold seats
+  of each COMSOL module (FNL licenses). A **Host filter** field (default
+  `*-*`, an fnmatch pattern like `impt-*`; `*` shows all) narrows the
+  report to matching workstations without re-querying the server.
 
 Click **Extract** to write the selected items to `<model_name>_results/`
 and, if the OriginLab checkbox is ticked, build `comsol_results.opju` in the
-same folder - which is then opened in File Explorer.
+same folder. The saved project is then opened in a fresh Origin instance and
+the results folder in File Explorer. Every dataset carries an
+`Extracted: YYYYMMDD` date stamp in its CSV `%` comments, `manifest.json`,
+and Origin worksheet comments.
 
 For the **OriginLab-only** workflow - re-importing a previously extracted
 `<model_name>_results/` folder without COMSOL (e.g. COMSOL isn't installed
@@ -68,9 +83,9 @@ whether to push to OriginLab.
 .venv\Scripts\python.exe COMSOLExtractor.py --comsol --origin
 ```
 
-This opens a file picker to choose the `.mph` model, then the combined
-status/items window with the OriginLab checkbox pre-ticked; clicking
-**Extract** writes the CSVs and builds an OriginLab project (`.opju`).
+This opens the combined status/items window with the OriginLab checkbox
+pre-ticked; clicking **Extract** writes the CSVs and builds an OriginLab
+project (`.opju`).
 
 If `--origin` is given without `--comsol`, OriginLab not running yet is the
 only thing checked beforehand with a console prompt (waits for Enter to
@@ -79,8 +94,8 @@ that path skips COMSOL/the model entirely.
 
 Other options:
 
-- `COMSOLExtractor.py model.mph --comsol` — extract a specific model (skips
-  the file dialog)
+- `COMSOLExtractor.py model.mph --comsol` — extract a specific model (loads
+  it immediately, no Open click needed)
 - `--output ./out` — custom output directory (COMSOL mode)
 - `--origin-template my_template.otpu` — Origin graph template for line plots
 - `--version` — print the version and exit
@@ -119,6 +134,14 @@ With `--comsol`, results are written to `<model_name>_results/` next to the
 
 With `--origin` alone, `comsol_results.opju` is written into the
 previously extracted folder you picked, built from its CSVs/`manifest.json`.
+
+## Code layout
+
+- `COMSOLExtractor.py` — command line and the extraction workflow
+- `extraction.py` — COMSOL data extraction and the CSV format
+- `origin_push.py` — OriginLab (`.opju`) integration via `originpro`
+- `license_check.py` — FlexNet (FNL) license-usage query and report
+- `gui.py` — PySide6 window, dialogs, and preview widgets
 
 ## How it works
 

@@ -1,0 +1,575 @@
+"""
+Qt GUI: the combined status/items/preview window (PySide6), the native file
+and folder pickers, and the matplotlib preview widgets.
+"""
+
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from pathlib import Path
+
+import pandas as pd
+import mph
+
+try:
+    from PySide6.QtCore import QObject, Qt, QTimer, Signal
+    from PySide6.QtGui import QFont
+    from PySide6.QtWidgets import (
+        QApplication, QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
+        QLineEdit, QListWidget, QListWidgetItem, QMdiArea, QPlainTextEdit,
+        QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
+        QVBoxLayout, QWidget,
+    )
+except ImportError:
+    sys.exit(
+        "ERROR: PySide6 not installed.\n"
+        "  pip install PySide6"
+    )
+
+from extraction import discover_items, extract_table, extract_via_export
+from license_check import query_license_usage, summarize_lmstat
+from origin_push import origin_already_running, start_originpro
+
+
+def qt_app() -> QApplication:
+    """Return the process-wide QApplication, creating it on first use."""
+    return QApplication.instance() or QApplication(sys.argv)
+
+
+def pick_file_dialog() -> Path | None:
+    """Open a native file-picker dialog and return the selected .mph path."""
+    qt_app()
+    file_path, _ = QFileDialog.getOpenFileName(
+        None, 'Select a COMSOL model file',
+        filter='COMSOL models (*.mph);;All files (*.*)',
+    )
+    return Path(file_path) if file_path else None
+
+
+def pick_folder_dialog(title: str) -> Path | None:
+    """Open a native folder-picker dialog and return the selected directory."""
+    qt_app()
+    folder = QFileDialog.getExistingDirectory(None, title)
+    return Path(folder) if folder else None
+
+
+# Fixed categorical color order for multi-curve line previews (Okabe-Ito,
+# colorblind-safe; validated for CVD separation on a light surface).
+PREVIEW_LINE_COLORS = ['#0072B2', '#E69F00', '#009E73', '#CC79A7', '#D55E00', '#56B4E9']
+
+PREVIEW_MAX_ROWS = 2000  # ponytail: Data tab caps preview rows; the CSV has the full data
+
+
+def make_preview_figure(df: pd.DataFrame, kind: str):
+    """Build a matplotlib Figure previewing a dataset: a line chart of each Y
+    vs the first column for tables/1D plots, a value-colored scatter
+    (viridis) for 2D/3D. Returns None if matplotlib is unavailable or the
+    data has fewer than two numeric columns."""
+    try:
+        from matplotlib.figure import Figure
+    except ImportError:
+        return None
+
+    num = df.select_dtypes('number')
+    if num.shape[1] < 2:
+        return None
+    cols = num.columns
+
+    fig = Figure(figsize=(5, 4), layout='tight')
+    if kind == '3d' and num.shape[1] >= 3:
+        ax = fig.add_subplot(projection='3d')
+        value_col = cols[3] if num.shape[1] > 3 else cols[2]
+        pts = ax.scatter(num[cols[0]], num[cols[1]], num[cols[2]],
+                         c=num[value_col], s=4, cmap='viridis')
+        fig.colorbar(pts, ax=ax, label=str(value_col), shrink=0.7)
+        ax.set_xlabel(str(cols[0]))
+        ax.set_ylabel(str(cols[1]))
+        ax.set_zlabel(str(cols[2]))
+    elif kind == '2d' and num.shape[1] >= 3:
+        ax = fig.add_subplot()
+        pts = ax.scatter(num[cols[0]], num[cols[1]], c=num[cols[2]],
+                         s=4, cmap='viridis')
+        fig.colorbar(pts, ax=ax, label=str(cols[2]))
+        ax.set_xlabel(str(cols[0]))
+        ax.set_ylabel(str(cols[1]))
+        ax.set_aspect('equal', adjustable='datalim')
+    else:
+        ax = fig.add_subplot()
+        ax.set_prop_cycle(color=PREVIEW_LINE_COLORS)
+        for col in cols[1:]:
+            ax.plot(num[cols[0]], num[col], lw=1.5, label=str(col))
+        ax.set_xlabel(str(cols[0]))
+        if num.shape[1] == 2:
+            ax.set_ylabel(str(cols[1]))  # single series: axis label, no legend
+        else:
+            ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+    return fig
+
+
+def make_data_table(df: pd.DataFrame) -> QTableWidget:
+    """Read-only spreadsheet view of a DataFrame for a preview's Data tab."""
+    nrows = min(len(df), PREVIEW_MAX_ROWS)
+    table = QTableWidget(nrows, len(df.columns))
+    table.setHorizontalHeaderLabels([str(c) for c in df.columns])
+    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    for i in range(nrows):
+        for j, val in enumerate(df.iloc[i]):
+            text = f"{val:.6g}" if isinstance(val, float) else str(val)
+            table.setItem(i, j, QTableWidgetItem(text))
+    return table
+
+
+# Display names for the groups shown in the item-picker, in the order shown.
+ITEM_GROUP_LABELS = {
+    'table': 'Tables',
+    '1d': '1D Plots',
+    '2d': '2D Plots',
+    '3d': '3D Plots',
+}
+
+
+def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
+                           push_to_origin_default: bool) -> dict | None:
+    """Open the combined status/items window immediately. An Open button
+    picks the .mph model (skipped if model_path is already given, e.g. from
+    the command line); COMSOL starts and loads it in a background thread
+    while the window stays responsive.
+
+    A status bar reports progress ("Starting COMSOL server...", "Loading
+    model...", ...). Once the model is loaded, the items checklist is
+    populated and Extract/Select All/Deselect All become available.
+
+    Clicking a loaded item opens a preview tab (plot + data grid) in the MDI
+    area on the right; a "License usage" button reports who currently holds
+    FlexNet (FNL) seats of the COMSOL modules, filterable by host pattern.
+
+    Returns {'client': ..., 'model': ..., 'model_path': ...,
+    'items': [...selected items...], 'push_to_origin': bool}, or None if
+    cancelled (closed the window or clicked Cancel, before or after loading).
+    """
+    app = qt_app()
+
+    win = QWidget()
+    win.setWindowTitle("COMSOL Extractor")
+    win.setWindowFlags(win.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+    win.resize(1080, 620)
+
+    # Left pane: status + item checklist. Right pane: MDI area whose tabs
+    # hold per-item previews and the license-usage report.
+    left = QWidget()
+    layout = QVBoxLayout(left)
+    layout.setContentsMargins(0, 0, 0, 0)
+
+    mdi = QMdiArea()
+    mdi.setViewMode(QMdiArea.ViewMode.TabbedView)
+    mdi.setTabsClosable(True)
+    mdi.setTabsMovable(True)
+
+    splitter = QSplitter()
+    splitter.addWidget(left)
+    splitter.addWidget(mdi)
+    splitter.setSizes([440, 640])
+    outer = QHBoxLayout(win)
+    outer.addWidget(splitter)
+
+    def set_led(led: QLabel, color: str):
+        led.setStyleSheet(f"background-color: {color}; border-radius: 7px;")
+
+    def make_led() -> QLabel:
+        led = QLabel()
+        led.setFixedSize(14, 14)
+        set_led(led, '#b0b0b0')
+        return led
+
+    # -- Status section --
+    status_box = QGroupBox("Status")
+    status_layout = QVBoxLayout(status_box)
+    layout.addWidget(status_box)
+
+    comsol_row = QHBoxLayout()
+    comsol_led = make_led()
+    comsol_label = QLabel("COMSOL: not started")
+    lic_btn = QPushButton("License usage")
+    comsol_row.addWidget(comsol_led)
+    comsol_row.addWidget(comsol_label)
+    comsol_row.addStretch()
+    comsol_row.addWidget(lic_btn)
+    status_layout.addLayout(comsol_row)
+
+    if comsol_warning:
+        warn = QLabel(comsol_warning)
+        warn.setWordWrap(True)
+        warn.setStyleSheet("color: #cc6600;")
+        status_layout.addWidget(warn)
+
+    origin_row = QHBoxLayout()
+    origin_led = make_led()
+    origin_status_lbl = QLabel("OriginLab: ...")
+    start_btn = QPushButton("Start OriginPro")
+    origin_row.addWidget(origin_led)
+    origin_row.addWidget(origin_status_lbl)
+    origin_row.addWidget(start_btn)
+    origin_row.addStretch()
+    status_layout.addLayout(origin_row)
+
+    push_check = QCheckBox("Import extracted results into OriginLab")
+    push_check.setChecked(push_to_origin_default)
+    status_layout.addWidget(push_check)
+
+    def refresh_origin_led() -> bool:
+        running = origin_already_running()
+        set_led(origin_led, '#2ecc40' if running else '#b0b0b0')
+        origin_status_lbl.setText(f"OriginLab: {'running' if running else 'not running'}")
+        return running
+
+    # Poll a few times after "Start OriginPro" is clicked, since the
+    # process can take a couple of seconds to appear.
+    origin_poll = QTimer(win)
+    origin_poll.setInterval(500)
+    poll_attempt = {'n': 0}
+
+    def poll_origin_status():
+        if refresh_origin_led():
+            origin_poll.stop()
+            push_check.setChecked(True)
+            start_btn.setEnabled(True)
+            start_btn.setText("Start OriginPro")
+            return
+        poll_attempt['n'] += 1
+        if poll_attempt['n'] >= 20:
+            origin_poll.stop()
+            origin_status_lbl.setText("OriginLab: starting... (taking a while)")
+            start_btn.setEnabled(True)
+            start_btn.setText("Start OriginPro")
+
+    origin_poll.timeout.connect(poll_origin_status)
+
+    def on_start_origin():
+        start_btn.setEnabled(False)
+        start_btn.setText("Starting...")
+        app.processEvents()  # repaint before the blocking COM connect
+        ok, err = start_originpro()
+        if not ok:
+            origin_status_lbl.setText(f"OriginLab: failed to start ({err[:60]})")
+            start_btn.setEnabled(True)
+            start_btn.setText("Start OriginPro")
+            return
+        poll_attempt['n'] = 0
+        origin_poll.start()
+
+    start_btn.clicked.connect(on_start_origin)
+    refresh_origin_led()
+
+    # -- Items section --
+    layout.addWidget(QLabel("Select which tables/plots to extract "
+                            "(click an item to preview it):"))
+    item_list = QListWidget()
+    layout.addWidget(item_list, 1)
+
+    def show_list_placeholder(text: str):
+        item_list.clear()
+        placeholder = QListWidgetItem(text)
+        placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+        item_list.addItem(placeholder)
+
+    show_list_placeholder("No model loaded - click Open to pick a .mph file.")
+
+    # -- Status bar --
+    status_bar = QLabel("Open a COMSOL model (.mph) to begin.")
+    status_bar.setStyleSheet("border: 1px inset palette(mid); padding: 2px 4px;")
+    layout.addWidget(status_bar)
+
+    check_items: list[QListWidgetItem] = []
+    state = {'client': None, 'model': None, 'model_path': model_path,
+             'items': [], 'cancelled': False, 'previewing': False,
+             'worker_start': time.monotonic(), 'lmstat_raw': '',
+             'license_info': '', 'status_text': ''}
+    result = {'items': None, 'push_to_origin': False}
+
+    def populate_items(items):
+        # One checkable row per item, under bold headings by kind; a new
+        # heading is only inserted when the group changes.
+        item_list.clear()
+        bold = QFont()
+        bold.setBold(True)
+        last_group = None
+        for item in items:
+            group = item['kind'] if item['kind'] in ITEM_GROUP_LABELS else 'other'
+            if group != last_group:
+                heading = QListWidgetItem(ITEM_GROUP_LABELS.get(group, 'Other'))
+                heading.setFont(bold)
+                heading.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                item_list.addItem(heading)
+                last_group = group
+            entry = QListWidgetItem(f"    {item['tag']}: {item['label']}")
+            entry.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+                           | Qt.ItemFlag.ItemIsSelectable)
+            entry.setCheckState(Qt.CheckState.Checked)
+            item_list.addItem(entry)
+            check_items.append(entry)
+
+    def set_all(checked: bool):
+        for entry in check_items:
+            entry.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+
+    def on_extract():
+        result['items'] = [
+            item for item, entry in zip(state['items'], check_items)
+            if entry.checkState() == Qt.CheckState.Checked
+        ]
+        result['push_to_origin'] = push_check.isChecked()
+        win.close()
+
+    # Buttons in work-sequence order: Open >> Select/Deselect >> Extract.
+    btn_row = QHBoxLayout()
+    open_btn = QPushButton("Open...")
+    select_all_btn = QPushButton("Select All")
+    deselect_all_btn = QPushButton("Deselect All")
+    extract_btn = QPushButton("Extract")
+    cancel_btn = QPushButton("Cancel")
+    for b in (select_all_btn, deselect_all_btn, extract_btn):
+        b.setEnabled(False)
+    select_all_btn.clicked.connect(lambda: set_all(True))
+    deselect_all_btn.clicked.connect(lambda: set_all(False))
+    extract_btn.clicked.connect(on_extract)
+    cancel_btn.clicked.connect(win.close)
+    btn_row.addWidget(open_btn)
+    btn_row.addWidget(select_all_btn)
+    btn_row.addWidget(deselect_all_btn)
+    btn_row.addStretch()
+    btn_row.addWidget(extract_btn)
+    btn_row.addWidget(cancel_btn)
+    layout.addLayout(btn_row)
+
+    # -- Start COMSOL, load the model, and discover items in the background --
+    # Qt signals are thread-safe when emitted from a plain Python thread
+    # (delivered as queued events on the GUI thread), so no polling loop is
+    # needed.
+    class WorkerSignals(QObject):
+        status = Signal(str)
+        ready = Signal(object, list)
+        error = Signal(str)
+        preview = Signal(object, object)   # item, (df, comments) or None
+        license = Signal(str, str)         # info line, raw lmstat output
+
+    signals = WorkerSignals()
+
+    def worker(path: Path):
+        try:
+            client = state['client']
+            if client is None:
+                signals.status.emit("Starting COMSOL server...")
+                client = mph.start()
+                # Store the client as soon as it exists so the cancel path
+                # below can shut it down even if the window closes mid-load.
+                state['client'] = client
+                if state['cancelled']:
+                    client.clear()
+                    return
+            else:
+                client.clear()  # drop the previously opened model
+            signals.status.emit(f"Loading model: {path.name}")
+            model = client.load(str(path))
+            signals.status.emit("Discovering extractable items...")
+            items = discover_items(model)
+            signals.ready.emit(model, items)
+        except Exception as e:
+            signals.error.emit(str(e))
+
+    def start_loading(path: Path):
+        state['model_path'] = path
+        state['model'] = None
+        state['items'] = []
+        check_items.clear()
+        show_list_placeholder("Waiting for COMSOL to load the model...")
+        # Previews belong to the previous model - close them.
+        for key, sub in list(open_tabs.items()):
+            if key != '__license__':
+                sub.close()
+        open_btn.setEnabled(False)
+        for b in (select_all_btn, deselect_all_btn, extract_btn):
+            b.setEnabled(False)
+        set_led(comsol_led, '#b0b0b0')
+        comsol_label.setText("COMSOL: starting...")
+        state['worker_start'] = time.monotonic()
+        state['status_text'] = "Starting COMSOL server..."
+        elapsed_timer.start()
+        threading.Thread(target=worker, args=(path,), daemon=True).start()
+
+    def on_open():
+        path = pick_file_dialog()
+        if path is not None:
+            start_loading(path.resolve())
+
+    open_btn.clicked.connect(on_open)
+
+    def on_status(text: str):
+        state['status_text'] = text
+        status_bar.setText(text)
+
+    def on_ready(model, items):
+        state['model'], state['items'] = model, items
+        elapsed_timer.stop()
+        open_btn.setEnabled(True)
+        set_led(comsol_led, '#2ecc40')
+        comsol_label.setText(f"COMSOL: model '{state['model_path'].name}' loaded")
+        if items:
+            populate_items(items)
+            status_bar.setText(f"Found {len(items)} extractable item(s). Ready.")
+            for b in (select_all_btn, deselect_all_btn, extract_btn):
+                b.setEnabled(True)
+        else:
+            show_list_placeholder("No extractable tables or plot groups found "
+                                  "in this model.")
+            status_bar.setText("No extractable tables or plot groups found in this model.")
+
+    def on_error(text: str):
+        elapsed_timer.stop()
+        open_btn.setEnabled(True)
+        set_led(comsol_led, '#ff4136')
+        comsol_label.setText("COMSOL: failed to start")
+        status_bar.setText(f"Error: {text}")
+        print(f"\n[!] {text}")
+
+    signals.status.connect(on_status)
+    signals.ready.connect(on_ready)
+    signals.error.connect(on_error)
+
+    # -- Preview tabs (MDI) --
+    open_tabs = {}  # preview key (item tag or '__license__') -> QMdiSubWindow
+
+    def add_mdi_tab(widget, title: str, key: str):
+        sub = mdi.addSubWindow(widget)
+        sub.setWindowTitle(title)
+        sub.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        sub.destroyed.connect(lambda *_, k=key: open_tabs.pop(k, None))
+        open_tabs[key] = sub
+        sub.show()
+
+    def request_preview(entry):
+        if entry is None or entry not in check_items:
+            return  # nothing selected, or a group heading
+        item = state['items'][check_items.index(entry)]
+        tag = item['tag']
+        if tag in open_tabs:
+            mdi.setActiveSubWindow(open_tabs[tag])
+            return
+        if state['previewing']:
+            return  # one preview extraction at a time; COMSOL calls don't overlap
+        state['previewing'] = True
+        status_bar.setText(f"Extracting preview of '{tag}'...")
+
+        def preview_worker():
+            try:
+                if item['kind'] == 'table':
+                    data = extract_table(state['model'], tag)
+                else:
+                    data = extract_via_export(state['model'], item['pg'], tag,
+                                              Path(tempfile.gettempdir()))
+            except Exception:
+                traceback.print_exc()
+                data = None
+            signals.preview.emit(item, data)
+
+        threading.Thread(target=preview_worker, daemon=True).start()
+
+    def on_preview(item, data):
+        state['previewing'] = False
+        if data is None or data[0].empty:
+            status_bar.setText(f"Preview of '{item['tag']}' failed - no data "
+                               "extracted (details in the console output).")
+            return
+        df = data[0]
+        tabs = QTabWidget()
+        try:
+            fig = make_preview_figure(df, item['kind'])
+            if fig is not None:
+                from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+                tabs.addTab(FigureCanvasQTAgg(fig), 'Plot')
+        except Exception:
+            traceback.print_exc()  # plot failed; still show the Data tab
+        tabs.addTab(make_data_table(df), 'Data')
+        add_mdi_tab(tabs, f"{item['tag']}: {item['label']}", item['tag'])
+        status_bar.setText(f"Preview ready: {item['tag']} "
+                           f"({len(df)} rows x {len(df.columns)} cols)")
+
+    item_list.itemClicked.connect(request_preview)
+    signals.preview.connect(on_preview)
+
+    # -- FlexNet license usage (host-filterable report tab) --
+    def on_license_clicked():
+        lic_btn.setEnabled(False)
+        status_bar.setText("Querying FlexNet license server (lmstat)...")
+        threading.Thread(target=lambda: signals.license.emit(*query_license_usage()),
+                         daemon=True).start()
+
+    def render_license():
+        key = '__license__'
+        if key not in open_tabs:
+            return
+        box = open_tabs[key].widget()
+        raw = state['lmstat_raw']
+        if not raw:
+            box.text_view.setPlainText(state['license_info'])
+            return
+        report = (summarize_lmstat(raw, box.filter_edit.text())
+                  or "Unexpected lmstat output (no 'Users of <module>' "
+                     "lines):\n\n" + raw)
+        box.text_view.setPlainText(f"{state['license_info']}\n\n{report}")
+
+    def on_license_report(info: str, raw: str):
+        lic_btn.setEnabled(True)
+        status_bar.setText("License report updated.")
+        state['license_info'], state['lmstat_raw'] = info, raw
+        key = '__license__'
+        if key not in open_tabs:
+            box = QWidget()
+            box_layout = QVBoxLayout(box)
+            filter_row = QHBoxLayout()
+            filter_row.addWidget(QLabel("Host filter:"))
+            box.filter_edit = QLineEdit('*-*')
+            box.filter_edit.setToolTip(
+                "fnmatch pattern applied to session hostnames, e.g. '*-*' or "
+                "'impt-*'; '*' shows all hosts")
+            filter_row.addWidget(box.filter_edit)
+            box_layout.addLayout(filter_row)
+            box.text_view = QPlainTextEdit()
+            box.text_view.setReadOnly(True)
+            box_layout.addWidget(box.text_view)
+            box.filter_edit.textChanged.connect(lambda _: render_license())
+            add_mdi_tab(box, "License usage", key)
+        render_license()
+        mdi.setActiveSubWindow(open_tabs[key])
+
+    lic_btn.clicked.connect(on_license_clicked)
+    signals.license.connect(on_license_report)
+
+    # Append elapsed time to the status bar while the model is loading.
+    elapsed_timer = QTimer(win)
+    elapsed_timer.setInterval(500)
+    elapsed_timer.timeout.connect(lambda: status_bar.setText(
+        f"{state['status_text']} ({int(time.monotonic() - state['worker_start'])}s)"))
+
+    if model_path is not None:
+        start_loading(model_path)
+
+    win.show()
+    app.exec()
+
+    if result['items'] is None:
+        state['cancelled'] = True
+        if state['client'] is not None:
+            try:
+                # Best effort: the worker may still be loading the model on
+                # this client; clear() can then fail, and the worker's own
+                # 'cancelled' check covers the client-created-after-close race.
+                state['client'].clear()
+            except Exception:
+                pass
+        return None
+    return {'client': state['client'], 'model': state['model'],
+            'model_path': state['model_path'], 'items': result['items'],
+            'push_to_origin': result['push_to_origin']}

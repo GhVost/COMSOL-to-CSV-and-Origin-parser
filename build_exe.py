@@ -10,7 +10,7 @@ Output is written to dist/COMSOLExtractor.exe.
 
 COMSOL Multiphysics and/or OriginLab must still be installed and licensed
 on the machine running the resulting .exe - this only bundles the Python
-side (MPh/JPype, pandas, originpro, tkinter, ...).
+side (MPh/JPype, pandas, originpro, PySide6, ...).
 """
 
 import subprocess
