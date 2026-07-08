@@ -425,6 +425,16 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
     # -- Items section --
     layout.addWidget(QLabel("Select which tables/plots to extract "
                             "(click an item to preview it):"))
+
+    # Category bevel: one tri-state checkbox per category present in the
+    # model, (de)selecting that whole group of items at once. Shown once a
+    # model is loaded.
+    cat_box = QGroupBox("Categories")
+    cat_layout = QHBoxLayout(cat_box)
+    cat_layout.addStretch()  # boxes are inserted before this stretch
+    cat_box.setVisible(False)
+    layout.addWidget(cat_box)
+
     item_list = QListWidget()
     layout.addWidget(item_list, 1)
 
@@ -461,16 +471,29 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
     result = {'items': None, 'push_to_origin': False, 'low_memory': False,
               'extraction': None}
 
-    # Checkable bold group heading -> its member entries; toggling the
-    # heading (de)selects the whole category at once.
-    group_members: dict[QListWidgetItem, list[QListWidgetItem]] = {}
+    # Category name -> its checkbox in the bevel / its member list entries.
+    # Keyed by the category string - QListWidgetItem is unhashable in
+    # PySide6, so list items must never be used as dict keys.
+    cat_boxes: dict[str, QCheckBox] = {}
+    cat_entries: dict[str, list[QListWidgetItem]] = {}
+
+    def set_category(group: str, checked: bool):
+        cs = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for entry in cat_entries.get(group, []):
+            entry.setCheckState(cs)
 
     def populate_items(items):
-        # Grouped by category (probe tables / tables / 1D / 2D / 3D), one
-        # checkable row per item showing the human-readable COMSOL label.
+        # Grouped by category (probe tables / tables / 1D / 2D / 3D): a
+        # tri-state checkbox per category in the bevel above, and one
+        # checkable row per item (human-readable COMSOL label, tag in the
+        # tooltip) under plain bold headings in the list.
         item_list.clear()
         check_items.clear()
-        group_members.clear()
+        for box in cat_boxes.values():
+            cat_layout.removeWidget(box)
+            box.deleteLater()
+        cat_boxes.clear()
+        cat_entries.clear()
         bold = QFont()
         bold.setBold(True)
         grouped: dict[str, list[dict]] = {}
@@ -480,12 +503,20 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
             members = grouped.get(group)
             if not members:
                 continue
-            heading = QListWidgetItem(ITEM_GROUP_LABELS.get(group, 'Other'))
+            title = ITEM_GROUP_LABELS.get(group, 'Other')
+            box = QCheckBox(title)
+            box.setChecked(True)
+            box.setToolTip(f"Select/deselect all {len(members)} item(s) under '{title}'")
+            # clicked fires only on user interaction, not on the programmatic
+            # setCheckState updates in on_list_item_changed - no feedback loop.
+            box.clicked.connect(lambda checked, g=group: set_category(g, checked))
+            cat_layout.insertWidget(cat_layout.count() - 1, box)
+            cat_boxes[group] = box
+            heading = QListWidgetItem(title)
             heading.setFont(bold)
-            heading.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
-            heading.setCheckState(Qt.CheckState.Checked)
+            heading.setFlags(Qt.ItemFlag.ItemIsEnabled)
             item_list.addItem(heading)
-            group_members[heading] = []
+            cat_entries[group] = []
             for item in members:
                 entry = QListWidgetItem(f"    {item['label']}")
                 entry.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
@@ -495,47 +526,32 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
                 entry.setToolTip(f"{item['tag']}: {item['label']}")
                 item_list.addItem(entry)
                 check_items.append(entry)
-                group_members[heading].append(entry)
-
-    # Guards the heading<->members synchronisation below so programmatic
-    # check-state updates don't re-trigger it.
-    sync = {'active': False}
+                cat_entries[group].append(entry)
+        cat_box.setVisible(bool(cat_boxes))
 
     def on_list_item_changed(changed):
-        if sync['active']:
+        # An item was (un)checked: mirror the category's overall state on
+        # its bevel checkbox - checked, unchecked, or partial for a
+        # hand-picked subset. Per-item choices are never overridden here.
+        item = changed.data(Qt.ItemDataRole.UserRole)
+        if not item:
+            return  # heading or placeholder row
+        group = item_group(item)
+        box, entries = cat_boxes.get(group), cat_entries.get(group)
+        if box is None or not entries:
             return
-        entries = group_members.get(changed)
-        if entries is not None:
-            # The heading itself was clicked: (de)select the whole category.
-            # PartiallyChecked is only ever set programmatically below - a
-            # user click always lands on Checked or Unchecked.
-            if changed.checkState() == Qt.CheckState.PartiallyChecked:
-                return
-            sync['active'] = True
-            for entry in entries:
-                entry.setCheckState(changed.checkState())
-            sync['active'] = False
-        else:
-            # A single item was toggled: keep its choice, and let the
-            # heading display the category's state - fully checked, fully
-            # unchecked, or partial for a hand-picked subset.
-            for heading, members in group_members.items():
-                if changed in members:
-                    states = {entry.checkState() for entry in members}
-                    sync['active'] = True
-                    heading.setCheckState(
-                        Qt.CheckState.Checked if states == {Qt.CheckState.Checked}
-                        else Qt.CheckState.Unchecked if states == {Qt.CheckState.Unchecked}
-                        else Qt.CheckState.PartiallyChecked)
-                    sync['active'] = False
-                    break
+        states = {entry.checkState() for entry in entries}
+        box.setCheckState(
+            Qt.CheckState.Checked if states == {Qt.CheckState.Checked}
+            else Qt.CheckState.Unchecked if states == {Qt.CheckState.Unchecked}
+            else Qt.CheckState.PartiallyChecked)
 
     item_list.itemChanged.connect(on_list_item_changed)
 
     def set_all(checked: bool):
         cs = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         for entry in check_items:
-            entry.setCheckState(cs)  # each toggle also refreshes its heading
+            entry.setCheckState(cs)  # each toggle also refreshes its category box
 
     def on_extract():
         selected = [
@@ -557,7 +573,7 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         state['ex_done'], state['ex_total'], state['ex_label'] = 0, len(selected), '...'
         state['ex_info'] = {'frac_done': 0.0, 'item_frac': 0.0, 'item_pred': -1.0}
         for w in (open_btn, select_all_btn, deselect_all_btn, extract_btn,
-                  cancel_btn, item_list, push_check, low_memory_check):
+                  cancel_btn, item_list, cat_box, push_check, low_memory_check):
             w.setEnabled(False)
         # Weighted work fraction in permille, not an item count - the bar
         # keeps moving through one long item.
@@ -756,7 +772,7 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         state['extracting'] = False
         progress_bar.setVisible(False)
         for w in (open_btn, select_all_btn, deselect_all_btn, extract_btn,
-                  cancel_btn, item_list, push_check, low_memory_check):
+                  cancel_btn, item_list, cat_box, push_check, low_memory_check):
             w.setEnabled(True)
         status_bar.setText(f"Extraction failed: {text} (details in the console)")
 
