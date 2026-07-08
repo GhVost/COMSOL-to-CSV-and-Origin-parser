@@ -38,12 +38,13 @@ Code layout:
     gui.py             - PySide6 window, dialogs, and preview widgets
 """
 
-__version__ = '1.9.0'
+__version__ = '1.10.0'
 
 import argparse
 import os
 import sys
 import json
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -73,6 +74,186 @@ def pause_if_frozen():
     OriginLab push errors - stay visible."""
     if getattr(sys, 'frozen', False):
         input("\nPress Enter to exit... ")
+
+
+def extract_selected(model, model_path: Path, selected: list, output_dir: Path,
+                     low_memory: bool, collect_datasets: bool,
+                     progress=None) -> tuple[dict, list | None]:
+    """Extract the selected items into output_dir (CSV files + manifest.json).
+
+    progress, if given, is called as progress(done, total, label, eta) when
+    each item starts, and once more with done == total at the end - the GUI
+    uses it for its progress bar and remaining-time estimate. eta is the
+    predicted seconds for all remaining items (or -1 when unknown): each
+    item's duration is recorded in <output_dir>/.extract_timing.json, so a
+    re-run of the same model predicts per-item times from that history
+    (implicitly weighting items by their data size), rescaled live by the
+    ratio of this run's actual vs predicted durations; items never seen
+    before fall back to this run's average.
+
+    Returns (manifest, datasets): the manifest dict (also written to
+    manifest.json) and, when collect_datasets is True, the list of
+    {'name', 'kind', 'df', 'comments'} dicts for push_to_origin(), else None.
+    """
+    # Date stamp recorded with every dataset (CSV '%' comments, manifest,
+    # and Origin worksheet comments), e.g. 'Extracted: 20260702'.
+    date_stamp = f"Extracted: {datetime.now().strftime('%Y%m%d')}"
+
+    # Top-level summary written to manifest.json at the end. Each list holds
+    # one dict per successfully extracted item (tag, label, output filename,
+    # row/column counts, and any comments).
+    manifest = {
+        'model': model_path.name,
+        'extracted_at': datetime.now().isoformat(),
+        'tables': [],
+        '1d_plots': [],
+        '2d_plots': [],
+        '3d_plots': [],
+        'other': [],
+    }
+    # Collected for direct OriginLab export ({'name', 'kind', 'df', 'comments'}
+    # per item) - only kept when actually needed, since holding every
+    # extracted item's full DataFrame for the whole run (on top of the one
+    # currently being extracted) is itself a common cause of running out of
+    # memory on a large model with many selected items.
+    datasets = [] if collect_datasets else None
+
+    # Per-item duration history from previous runs of this model ('tag' ->
+    # {'seconds': float, 'rows': int}) - a re-run predicts each remaining
+    # item's time from how long that same item (at its recorded size) took
+    # last time, so one huge half-million-row plot among small tables is
+    # weighted accordingly instead of being averaged away.
+    timing_path = output_dir / '.extract_timing.json'
+    try:
+        with open(timing_path, encoding='utf-8') as f:
+            history = json.load(f)
+        history = {tag: rec for tag, rec in history.items()
+                   if isinstance(rec, dict) and isinstance(rec.get('seconds'), (int, float))}
+    except Exception:
+        history = {}
+    durations: dict[str, float] = {}  # this run's actual seconds per tag
+
+    def eta_seconds(next_index: int) -> float:
+        """Predicted seconds for items[next_index:]: per-item history where
+        available - rescaled by this run's observed actual/predicted ratio -
+        and this run's average for never-seen items; -1 if unknowable yet."""
+        pred_done = sum(history[s['tag']]['seconds'] for s in selected[:next_index]
+                        if s['tag'] in history and s['tag'] in durations)
+        act_done = sum(durations[s['tag']] for s in selected[:next_index]
+                       if s['tag'] in history and s['tag'] in durations)
+        scale = act_done / pred_done if pred_done > 0 else 1.0
+        avg = sum(durations.values()) / len(durations) if durations else None
+        eta = 0.0
+        for s in selected[next_index:]:
+            if s['tag'] in history:
+                eta += history[s['tag']]['seconds'] * scale
+            elif avg is not None:
+                eta += avg
+            else:
+                return -1.0  # first run, nothing measured yet
+        return eta
+
+    total = len(selected)
+    for done, item in enumerate(selected):
+        tag, label, kind = item['tag'], item['label'], item['kind']
+        if progress is not None:
+            progress(done, total, f"{tag} ({label})", eta_seconds(done))
+        item_t0 = time.monotonic()
+
+        if kind == 'table':
+            print(f"  - {tag} ({label})")
+            result = extract_table(model, tag, low_memory=low_memory)
+            if result is not None and not result[0].empty:
+                df, comments = result
+                comments = comments + [date_stamp]
+                name = sanitize_filename(f"table_{tag}_{label}")
+                fname = name + '.csv'
+                write_csv_with_comments(df, output_dir / fname, comments)
+                manifest['tables'].append({'tag': tag, 'label': label, 'file': fname,
+                                           'rows': len(df), 'cols': list(df.columns),
+                                           'comments': comments})
+                if datasets is not None:
+                    datasets.append({'name': name, 'kind': 'table', 'df': df, 'comments': comments})
+                print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
+            durations[tag] = time.monotonic() - item_t0
+            history[tag] = {'seconds': durations[tag],
+                            'rows': len(result[0]) if result is not None else 0}
+            continue
+
+        # Everything else (1D/2D/3D plot groups, or anything else
+        # get_plot_type() couldn't classify) goes through COMSOL's "Plot"
+        # export and is written as 'plot<kind>_<tag>_<label>.csv'.
+        pg, class_name, ptype = item['pg'], item['class_name'], kind
+        print(f"\n  [{ptype.upper():>7}] {tag} ({label})  [{class_name}]")
+
+        result = extract_via_export(model, pg, tag, output_dir, kind=ptype, low_memory=low_memory)
+        if result is not None and not result[0].empty:
+            df, comments = result
+
+            try:
+                note = str(pg.comments())
+                if note:
+                    comments = [note] + comments
+            except Exception:
+                pass
+            comments = comments + [date_stamp]
+
+            name = sanitize_filename(f"plot{ptype}_{tag}_{label}")
+            fname = name + '.csv'
+            write_csv_with_comments(df, output_dir / fname, comments)
+            entry = {'tag': tag, 'label': label, 'file': fname,
+                     'rows': len(df), 'cols': list(df.columns), 'comments': comments}
+            if ptype in ('1d', '2d', '3d'):
+                manifest[f'{ptype}_plots'].append(entry)
+            else:
+                # Unrecognized plot dimension - record under 'other' with its
+                # Java class name for diagnostics.
+                entry['type'] = class_name
+                manifest['other'].append(entry)
+            if datasets is not None:
+                datasets.append({'name': name, 'kind': ptype, 'df': df, 'comments': comments})
+            print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
+        else:
+            # Export/parse failed (e.g. empty plot, unsupported export) -
+            # record it without a file so it's still visible in the manifest.
+            entry = {'tag': tag, 'label': label}
+            if ptype not in ('1d', '2d', '3d'):
+                entry['type'] = class_name
+                manifest['other'].append(entry)
+            print(f"    [!] No data extracted for '{tag}'")
+
+        durations[tag] = time.monotonic() - item_t0
+        history[tag] = {'seconds': durations[tag],
+                        'rows': len(result[0]) if result is not None else 0}
+
+    if progress is not None:
+        progress(total, total, 'writing manifest...', 0.0)
+
+    # Save the measured per-item durations for the next run's estimates.
+    try:
+        with open(timing_path, 'w', encoding='utf-8') as f:
+            json.dump(history, f, indent=2)
+    except OSError as e:
+        print(f"  [!] Could not save timing history: {e}")
+
+    # -- Write manifest --
+    manifest_path = output_dir / 'manifest.json'
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    print(f"\nManifest written: {manifest_path}")
+
+    # -- Summary --
+    print(f"\n{'='*50}")
+    print(f"Extraction complete!")
+    print(f"  Tables:    {len(manifest['tables'])}")
+    print(f"  1D plots:  {len(manifest['1d_plots'])}")
+    print(f"  2D plots:  {len(manifest['2d_plots'])}")
+    print(f"  3D plots:  {len(manifest['3d_plots'])}")
+    print(f"  Other:     {len(manifest['other'])}")
+    print(f"  Output:    {output_dir}")
+    print(f"{'='*50}")
+
+    return manifest, datasets
 
 
 def main():
@@ -156,132 +337,46 @@ def main():
             "memory and may take a bit longer to start)."
         )
 
+    # Runs inside the window's extraction thread once Extract is clicked;
+    # the window stays open and shows a progress bar / remaining-time
+    # estimate fed by the progress callback.
+    def do_extract(model, chosen_path: Path, selected: list, low_memory: bool,
+                   collect_datasets: bool, progress) -> dict:
+        # -- Output folder: same location as .mph, named <stem>_results --
+        if args.output:
+            output_dir = Path(args.output).resolve()
+        else:
+            output_dir = chosen_path.parent / f"{chosen_path.stem}_results"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Output folder: {output_dir}")
+
+        manifest, datasets = extract_selected(
+            model, chosen_path, selected, output_dir,
+            low_memory=low_memory, collect_datasets=collect_datasets,
+            progress=progress)
+        return {'output_dir': output_dir, 'manifest': manifest, 'datasets': datasets}
+
     # -- Combined status + item-selection window, shown immediately --
     choice = run_extraction_window(model_path, comsol_warning, do_origin,
-                                    low_memory_default=args.low_memory)
+                                    low_memory_default=args.low_memory,
+                                    extract_fn=do_extract)
     if choice is None:
         print("Nothing selected. Exiting.")
         return
-    client, model = choice['client'], choice['model']
+    client = choice['client']
     if not choice['items']:
         print("Nothing selected. Exiting.")
         client.clear()
         return
-    selected = choice['items']
     do_origin = choice['push_to_origin']
-    low_memory = choice['low_memory']
-    model_path = choice['model_path']
-
-    # -- Output folder: same location as .mph, named <stem>_results --
-    if args.output:
-        output_dir = Path(args.output).resolve()
-    else:
-        output_dir = model_path.parent / f"{model_path.stem}_results"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Output folder: {output_dir}")
-
-    # Date stamp recorded with every dataset (CSV '%' comments, manifest,
-    # and Origin worksheet comments), e.g. 'Extracted: 20260702'.
-    date_stamp = f"Extracted: {datetime.now().strftime('%Y%m%d')}"
-
-    # Top-level summary written to manifest.json at the end. Each list holds
-    # one dict per successfully extracted item (tag, label, output filename,
-    # row/column counts, and any comments).
-    manifest = {
-        'model': model_path.name,
-        'extracted_at': datetime.now().isoformat(),
-        'tables': [],
-        '1d_plots': [],
-        '2d_plots': [],
-        '3d_plots': [],
-        'other': [],
-    }
-    # Collected for direct OriginLab export ({'name', 'kind', 'df', 'comments'}
-    # per item) - only kept when actually needed, since holding every
-    # extracted item's full DataFrame for the whole run (on top of the one
-    # currently being extracted) is itself a common cause of running out of
-    # memory on a large model with many selected items.
-    datasets = [] if do_origin else None
-
-    # ---- Extract selected items ----
-    for item in selected:
-        tag, label, kind = item['tag'], item['label'], item['kind']
-
-        if kind == 'table':
-            print(f"  - {tag} ({label})")
-            result = extract_table(model, tag, low_memory=low_memory)
-            if result is not None and not result[0].empty:
-                df, comments = result
-                comments = comments + [date_stamp]
-                name = sanitize_filename(f"table_{tag}_{label}")
-                fname = name + '.csv'
-                write_csv_with_comments(df, output_dir / fname, comments)
-                manifest['tables'].append({'tag': tag, 'label': label, 'file': fname,
-                                           'rows': len(df), 'cols': list(df.columns),
-                                           'comments': comments})
-                if datasets is not None:
-                    datasets.append({'name': name, 'kind': 'table', 'df': df, 'comments': comments})
-                print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
-            continue
-
-        # Everything else (1D/2D/3D plot groups, or anything else
-        # get_plot_type() couldn't classify) goes through COMSOL's "Plot"
-        # export and is written as 'plot<kind>_<tag>_<label>.csv'.
-        pg, class_name, ptype = item['pg'], item['class_name'], kind
-        print(f"\n  [{ptype.upper():>7}] {tag} ({label})  [{class_name}]")
-
-        result = extract_via_export(model, pg, tag, output_dir, kind=ptype, low_memory=low_memory)
-        if result is not None and not result[0].empty:
-            df, comments = result
-
-            try:
-                note = str(pg.comments())
-                if note:
-                    comments = [note] + comments
-            except Exception:
-                pass
-            comments = comments + [date_stamp]
-
-            name = sanitize_filename(f"plot{ptype}_{tag}_{label}")
-            fname = name + '.csv'
-            write_csv_with_comments(df, output_dir / fname, comments)
-            entry = {'tag': tag, 'label': label, 'file': fname,
-                     'rows': len(df), 'cols': list(df.columns), 'comments': comments}
-            if ptype in ('1d', '2d', '3d'):
-                manifest[f'{ptype}_plots'].append(entry)
-            else:
-                # Unrecognized plot dimension - record under 'other' with its
-                # Java class name for diagnostics.
-                entry['type'] = class_name
-                manifest['other'].append(entry)
-            if datasets is not None:
-                datasets.append({'name': name, 'kind': ptype, 'df': df, 'comments': comments})
-            print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
-        else:
-            # Export/parse failed (e.g. empty plot, unsupported export) -
-            # record it without a file so it's still visible in the manifest.
-            entry = {'tag': tag, 'label': label}
-            if ptype not in ('1d', '2d', '3d'):
-                entry['type'] = class_name
-                manifest['other'].append(entry)
-            print(f"    [!] No data extracted for '{tag}'")
-
-    # -- Write manifest --
-    manifest_path = output_dir / 'manifest.json'
-    with open(manifest_path, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=False)
-    print(f"\nManifest written: {manifest_path}")
-
-    # -- Summary --
-    print(f"\n{'='*50}")
-    print(f"Extraction complete!")
-    print(f"  Tables:    {len(manifest['tables'])}")
-    print(f"  1D plots:  {len(manifest['1d_plots'])}")
-    print(f"  2D plots:  {len(manifest['2d_plots'])}")
-    print(f"  3D plots:  {len(manifest['3d_plots'])}")
-    print(f"  Other:     {len(manifest['other'])}")
-    print(f"  Output:    {output_dir}")
-    print(f"{'='*50}")
+    extraction = choice['extraction']
+    if extraction is None:
+        # Extraction failed inside the window (error already printed there).
+        client.clear()
+        pause_if_frozen()
+        return
+    output_dir = extraction['output_dir']
+    datasets = extraction['datasets']
 
     # -- Optional: push to OriginLab --
     if do_origin:

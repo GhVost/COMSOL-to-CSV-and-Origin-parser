@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import traceback
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -19,8 +20,8 @@ try:
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
         QLineEdit, QListWidget, QListWidgetItem, QMdiArea, QPlainTextEdit,
-        QPushButton, QSlider, QSplitter, QTableWidget, QTableWidgetItem,
-        QTabWidget, QVBoxLayout, QWidget,
+        QProgressBar, QPushButton, QSlider, QSplitter, QTableWidget,
+        QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
     )
 except ImportError:
     sys.exit(
@@ -262,7 +263,8 @@ ITEM_GROUP_LABELS = {
 
 def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
                            push_to_origin_default: bool,
-                           low_memory_default: bool = False) -> dict | None:
+                           low_memory_default: bool = False,
+                           extract_fn=None) -> dict | None:
     """Open the combined status/items window immediately. An Open button
     picks the .mph model (skipped if model_path is already given, e.g. from
     the command line); COMSOL starts and loads it in a background thread
@@ -276,10 +278,18 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
     area on the right; a "License usage" button reports who currently holds
     FlexNet (FNL) seats of the COMSOL modules, filterable by host pattern.
 
+    extract_fn(model, model_path, selected_items, low_memory,
+    collect_datasets, progress) runs the extraction itself: clicking Extract
+    keeps the window open, runs extract_fn in a background thread, and shows
+    a progress bar with a remaining-time estimate (average duration of
+    finished items x items left) fed by progress(done, total, label)
+    callbacks. The window closes itself when extract_fn returns; its return
+    value is passed back under 'extraction'.
+
     Returns {'client': ..., 'model': ..., 'model_path': ...,
     'items': [...selected items...], 'push_to_origin': bool,
-    'low_memory': bool}, or None if cancelled (closed the window or clicked
-    Cancel, before or after loading).
+    'low_memory': bool, 'extraction': ...}, or None if cancelled (closed the
+    window or clicked Cancel, before or after loading).
     """
     app = qt_app()
 
@@ -417,7 +427,11 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
 
     show_list_placeholder("No model loaded - click Open to pick a .mph file.")
 
-    # -- Status bar --
+    # -- Extraction progress bar (shown only while extracting) + status bar --
+    progress_bar = QProgressBar()
+    progress_bar.setVisible(False)
+    layout.addWidget(progress_bar)
+
     status_bar = QLabel("Open a COMSOL model (.mph) to begin.")
     status_bar.setStyleSheet("border: 1px inset palette(mid); padding: 2px 4px;")
     layout.addWidget(status_bar)
@@ -427,8 +441,14 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
              'items': [], 'cancelled': False, 'previewing': False,
              'pending_preview': None,
              'worker_start': time.monotonic(), 'lmstat_raw': '',
-             'license_info': '', 'status_text': ''}
-    result = {'items': None, 'push_to_origin': False, 'low_memory': False}
+             'license_info': '', 'status_text': '',
+             # Extraction-progress bookkeeping: current item start time,
+             # items finished, items total, current item label, predicted
+             # seconds remaining (-1 = unknown).
+             'extracting': False, 'ex_item_t0': 0.0,
+             'ex_done': 0, 'ex_total': 0, 'ex_label': '', 'ex_eta': -1.0}
+    result = {'items': None, 'push_to_origin': False, 'low_memory': False,
+              'extraction': None}
 
     def populate_items(items):
         # One checkable row per item, under bold headings by kind; a new
@@ -457,13 +477,48 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
             entry.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
 
     def on_extract():
-        result['items'] = [
+        selected = [
             item for item, entry in zip(state['items'], check_items)
             if entry.checkState() == Qt.CheckState.Checked
         ]
         result['push_to_origin'] = push_check.isChecked()
         result['low_memory'] = low_memory_check.isChecked()
-        win.close()
+        if extract_fn is None or not selected:
+            result['items'] = selected
+            win.close()
+            return
+
+        # Keep the window open and run the extraction in a background
+        # thread, showing per-item progress; the window closes itself once
+        # extract_fn finishes (see on_extract_done).
+        state['extracting'] = True
+        state['ex_item_t0'] = time.monotonic()
+        state['ex_done'], state['ex_total'], state['ex_label'] = 0, len(selected), '...'
+        state['ex_eta'] = -1.0
+        for w in (open_btn, select_all_btn, deselect_all_btn, extract_btn,
+                  cancel_btn, item_list, push_check, low_memory_check):
+            w.setEnabled(False)
+        progress_bar.setRange(0, len(selected))
+        progress_bar.setValue(0)
+        progress_bar.setVisible(True)
+        update_extract_status()
+        extract_timer.start()
+
+        low_memory, collect = result['low_memory'], result['push_to_origin']
+
+        def extract_worker():
+            try:
+                out = extract_fn(
+                    state['model'], state['model_path'], selected,
+                    low_memory, collect,
+                    lambda done, total, label, eta:
+                        signals.extract_progress.emit(done, total, label, eta))
+                signals.extract_done.emit((selected, out))
+            except Exception as e:
+                traceback.print_exc()
+                signals.extract_error.emit(str(e))
+
+        threading.Thread(target=extract_worker, daemon=True).start()
 
     # Buttons in work-sequence order: Open >> Select/Deselect >> Extract.
     btn_row = QHBoxLayout()
@@ -497,6 +552,9 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         error = Signal(str)
         preview = Signal(object, object)   # item, (df, comments) or None
         license = Signal(str, str)         # info line, raw lmstat output
+        extract_progress = Signal(int, int, str, float)  # done, total, label, eta seconds (-1 unknown)
+        extract_done = Signal(object)      # (selected items, extract_fn result)
+        extract_error = Signal(str)
 
     signals = WorkerSignals()
 
@@ -588,10 +646,52 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         status_bar.setText(f"Error: {text}")
         print(f"\n[!] {text}")
 
+    # -- Extraction progress: bar + "item i/N, elapsed, ~remaining" status --
+    def format_hms(seconds: float) -> str:
+        return str(timedelta(seconds=max(int(seconds), 0)))
+
+    def update_extract_status():
+        done, total = state['ex_done'], state['ex_total']
+        cur = time.monotonic() - state['ex_item_t0']
+        text = (f"Extracting {min(done + 1, total)}/{total}: {state['ex_label']}  "
+                f"(item {format_hms(cur)}")
+        if state['ex_eta'] >= 0:
+            # Size-aware estimate from extract_selected: per-item history of
+            # previous runs (rescaled by this run's speed) or this run's
+            # average, minus what the current item has already used.
+            text += f", ~{format_hms(state['ex_eta'] - cur)} remaining"
+        status_bar.setText(text + ")")
+
+    def on_extract_progress(done: int, total: int, label: str, eta: float):
+        state['ex_done'], state['ex_label'], state['ex_eta'] = done, label, eta
+        state['ex_item_t0'] = time.monotonic()
+        progress_bar.setValue(done)
+        update_extract_status()
+
+    def on_extract_done(payload):
+        selected, out = payload
+        extract_timer.stop()
+        state['extracting'] = False
+        result['items'] = selected
+        result['extraction'] = out
+        win.close()
+
+    def on_extract_error(text: str):
+        extract_timer.stop()
+        state['extracting'] = False
+        progress_bar.setVisible(False)
+        for w in (open_btn, select_all_btn, deselect_all_btn, extract_btn,
+                  cancel_btn, item_list, push_check, low_memory_check):
+            w.setEnabled(True)
+        status_bar.setText(f"Extraction failed: {text} (details in the console)")
+
     signals.status.connect(on_status)
     signals.server_ready.connect(on_server_ready)
     signals.ready.connect(on_ready)
     signals.error.connect(on_error)
+    signals.extract_progress.connect(on_extract_progress)
+    signals.extract_done.connect(on_extract_done)
+    signals.extract_error.connect(on_extract_error)
 
     # -- Preview tabs (MDI) --
     open_tabs = {}  # preview key (item tag or '__license__') -> QMdiSubWindow
@@ -738,6 +838,17 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
     elapsed_timer.timeout.connect(lambda: status_bar.setText(
         f"{state['status_text']} ({int(time.monotonic() - state['worker_start'])}s)"))
 
+    # Tick the current item's elapsed time / remaining estimate while a
+    # single long COMSOL call blocks the extraction thread.
+    extract_timer = QTimer(win)
+    extract_timer.setInterval(500)
+    extract_timer.timeout.connect(update_extract_status)
+
+    # Ignore attempts to close the window mid-extraction - the extraction
+    # thread is deep in a blocking COMSOL call and cannot be cancelled.
+    win.closeEvent = lambda event: (
+        event.ignore() if state['extracting'] else event.accept())
+
     if model_path is not None:
         start_loading(model_path)
 
@@ -757,4 +868,5 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         return None
     return {'client': state['client'], 'model': state['model'],
             'model_path': state['model_path'], 'items': result['items'],
-            'push_to_origin': result['push_to_origin'], 'low_memory': result['low_memory']}
+            'push_to_origin': result['push_to_origin'], 'low_memory': result['low_memory'],
+            'extraction': result['extraction']}

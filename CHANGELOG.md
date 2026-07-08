@@ -1,5 +1,37 @@
 # Changelog
 
+## v1.10.0 — 2026-07-08
+
+In-window extraction progress with size-aware time estimates.
+
+### Changed
+- **The window now stays open during extraction** instead of closing the
+  moment Extract is clicked: controls grey out, a progress bar counts the
+  items, and the status line shows the current item with its ticking
+  elapsed time and an estimated time remaining. Closing the window
+  mid-extraction is ignored (the underlying COMSOL call cannot be
+  cancelled); if extraction fails, the window stays open with the error in
+  the status line. Previously the window vanished and all progress went to
+  the console only - which on a huge model looked like a crash while a
+  single silent COMSOL call was still running.
+- The extraction loop moved out of `main()` into `extract_selected()`,
+  driven by the window through a `progress(done, total, label, eta)`
+  callback; console output is unchanged.
+
+### Added
+- **Size-aware remaining-time estimate.** Every run records each item's
+  actual duration and row count to `.extract_timing.json` in the results
+  folder. A re-run of the same model predicts each remaining item's time
+  from its own history - so one half-million-row plot among small probe
+  tables is weighted as such, not averaged away - and continuously rescales
+  all predictions by the ratio of this run's actual vs predicted durations
+  (e.g. after a finer re-solve everything runs ~2x longer and the estimate
+  stretches accordingly). Items with no history use the current run's
+  average; a first-ever run shows elapsed time only until the first item
+  completes.
+- `tests/test_extract_selected.py` - progress/ETA callback sequence,
+  CSV/manifest output, timing-history save and reuse.
+
 ## v1.9.0 — 2026-07-02
 
 Deformation preview and large-model memory reliability release.
