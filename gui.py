@@ -497,23 +497,45 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
                 check_items.append(entry)
                 group_members[heading].append(entry)
 
+    # Guards the heading<->members synchronisation below so programmatic
+    # check-state updates don't re-trigger it.
+    sync = {'active': False}
+
     def on_list_item_changed(changed):
-        # A toggled group heading checks/unchecks its whole category.
-        # Member entries changing hit the dict lookup miss and fall through,
-        # so there is no recursion.
+        if sync['active']:
+            return
         entries = group_members.get(changed)
-        if entries:
+        if entries is not None:
+            # The heading itself was clicked: (de)select the whole category.
+            # PartiallyChecked is only ever set programmatically below - a
+            # user click always lands on Checked or Unchecked.
+            if changed.checkState() == Qt.CheckState.PartiallyChecked:
+                return
+            sync['active'] = True
             for entry in entries:
                 entry.setCheckState(changed.checkState())
+            sync['active'] = False
+        else:
+            # A single item was toggled: keep its choice, and let the
+            # heading display the category's state - fully checked, fully
+            # unchecked, or partial for a hand-picked subset.
+            for heading, members in group_members.items():
+                if changed in members:
+                    states = {entry.checkState() for entry in members}
+                    sync['active'] = True
+                    heading.setCheckState(
+                        Qt.CheckState.Checked if states == {Qt.CheckState.Checked}
+                        else Qt.CheckState.Unchecked if states == {Qt.CheckState.Unchecked}
+                        else Qt.CheckState.PartiallyChecked)
+                    sync['active'] = False
+                    break
 
     item_list.itemChanged.connect(on_list_item_changed)
 
     def set_all(checked: bool):
         cs = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
-        for heading in group_members:
-            heading.setCheckState(cs)  # heading propagates to its members
         for entry in check_items:
-            entry.setCheckState(cs)
+            entry.setCheckState(cs)  # each toggle also refreshes its heading
 
     def on_extract():
         selected = [
