@@ -165,14 +165,20 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = '') -> Path
                 sheet.cols_axis('xy', repeat=True)
 
             # Carry column names/units (from 'Name (unit)' headers) over to
-            # Origin's long name / units label rows.
+            # Origin's long name / units label rows. Curve columns get the
+            # full sweep-parameter list as their long name (that's what the
+            # legend shows), with the complete original header - quantity
+            # included - preserved in the column's Comments row.
             for i, col in enumerate(df.columns):
-                label, unit = split_label_unit(col)
+                full, unit = split_label_unit(col)
+                label = full
                 if i > 0 and kind in ('table', '1d'):
                     label = legend_label_from_column(col)
                 sheet.set_label(i, label, type='L')
                 if unit:
                     sheet.set_label(i, unit, type='U')
+                if label != full:
+                    sheet.set_label(i, full, type='C')
 
             if comments:
                 try:

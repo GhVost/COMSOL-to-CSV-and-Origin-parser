@@ -55,12 +55,15 @@ def legend_label_from_column(label: str) -> str:
     """Return the curve legend text encoded in a COMSOL-style column header.
 
     COMSOL multi-curve exports commonly use headers such as
-    ``Iout (mA), V_dc=1 V``. The measured quantity and unit belong on the
-    worksheet/axis, while the suffix after the comma is the legend entry.
+    ``Iout (mA), V_dc=1 V`` - or, for nested sweeps,
+    ``Iout (mA), gap=2 um, ring=1.3 um``. The measured quantity and unit
+    belong on the worksheet/axis; everything after the quantity is the
+    legend entry, keeping *all* sweep-parameter values (dropping any of
+    them would make same-valued inner-sweep curves indistinguishable).
     """
     name, _unit = split_label_unit(label)
     parts = [part.strip() for part in name.split(',') if part.strip()]
-    return parts[-1] if len(parts) > 1 else name
+    return ', '.join(parts[1:]) if len(parts) > 1 else name
 
 
 def legend_labels_comment(labels: list[str]) -> str:

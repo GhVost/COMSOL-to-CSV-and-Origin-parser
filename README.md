@@ -49,8 +49,12 @@ then click **Extract**. The window contains:
   If a COMSOL process was already running before this session started, a
   warning is shown here too (an extra engine instance/license seat will be
   used).
-- **Items to extract** - a checklist of tables/plot groups, grouped by type
-  (Tables / 1D / 2D / 3D Plots), all checked by default. **Clicking** an
+- **Items to extract** - a checklist of tables/plot groups, grouped by
+  category (Probe Tables / Tables / 1D / 2D / 3D Plots), all checked by
+  default. Each bold group heading is itself a checkbox that selects or
+  deselects its whole category at once. Items are listed by their
+  human-readable COMSOL label ("Probe Table 1", "S-parameter"); hover an
+  item to see the internal COMSOL tag (`tbl1`, `pg66`, ...). **Clicking** an
   item extracts it once and opens a preview tab in the MDI area on the
   right. Tables open as a **Data** grid only; 1D plots open as separate
   line series (no markers on the line itself) with legend entries taken
@@ -76,10 +80,19 @@ then click **Extract**. The window contains:
 
 Click **Extract** to write the selected items to `<model_name>_results/`
 and, if the OriginLab checkbox is ticked, build `comsol_results.opju` in the
-same folder. The saved project is then opened in a fresh Origin instance and
-the results folder in File Explorer. Every dataset carries an
-`Extracted: YYYYMMDD` date stamp in its CSV `%` comments, `manifest.json`,
-and Origin worksheet comments.
+same folder. The window stays open while the extraction runs, showing a
+progress bar (weighted by each item's expected share of the work, so it
+keeps moving through one long item) and a status line with the current
+item, the total elapsed time, and an estimated time remaining. The estimate
+is pace-based - elapsed time extrapolated over the work fraction still
+left - with each item's actual duration and row count recorded to
+`.extract_timing.json` in the results folder, so a re-run of the same model
+weights every item by how long it took last time (one huge plot among small
+tables is predicted as such); a first-ever run shows "estimating..." until
+the first item completes. The saved project is then opened in a fresh
+Origin instance and the results folder in File Explorer. Every dataset
+carries an `Extracted: YYYYMMDD` date stamp in its CSV `%` comments,
+`manifest.json`, and Origin worksheet comments.
 
 For the **OriginLab-only** workflow - re-importing a previously extracted
 `<model_name>_results/` folder without COMSOL (e.g. COMSOL isn't installed
@@ -159,11 +172,15 @@ With `--comsol`, results are written to `<model_name>_results/` next to the
 `.mph` file:
 
 - One CSV per result table and per plot group (1D/2D/3D), named after the
-  COMSOL tag and label. Column headers include COMSOL's units (e.g.
+  COMSOL label (e.g. `Probe_Table_1.csv`); the internal COMSOL tag is
+  appended only to disambiguate duplicate labels and is always recorded in
+  `manifest.json`. Column headers include COMSOL's units (e.g.
   `Total displacement (m)`), and any model/description metadata or
   user-entered "Comments" are written as leading `%` comment lines.
 - `manifest.json` — summary of everything extracted (tags, labels, files,
   row/column counts, and the same comments)
+- `.extract_timing.json` — per-item durations/row counts from the last run,
+  used to weight the next run's progress bar and remaining-time estimate
 - `comsol_results.opju` (only with `--origin`) — an OriginLab project with
   one worksheet per dataset; tables and 1D plots additionally get a line
   graph
@@ -208,11 +225,16 @@ previously extracted folder you picked, built from its CSVs/`manifest.json`.
 - If `--origin` is given together with `--comsol`, the in-memory data is
   pushed straight into Origin via `originpro` (COM automation) — no CSV
   round-trip needed. Column long names/units and the comments are applied to
-  each worksheet. Parametric line sweeps exported as stitched x/y pairs are
-  split into separate **line-only** Origin series (no symbols) with legend
-  entries taken from COMSOL's own curve labels where available, so the
-  graph matches COMSOL's plot instead of drawing connector zigzags between
-  parameter values.
+  each worksheet: a curve column's long name carries the **full
+  sweep-parameter list** from COMSOL's header (e.g.
+  `gap=2 µm, external_ring=1.3 µm` for nested sweeps - dropping any
+  parameter would make same-valued inner-sweep curves indistinguishable),
+  and the complete original header, measured quantity included, is
+  preserved in that column's Comments row. Parametric line sweeps exported
+  as stitched x/y pairs are split into separate **line-only** Origin series
+  (no symbols) with legend entries taken from COMSOL's own curve labels
+  where available, so the graph matches COMSOL's plot instead of drawing
+  connector zigzags between parameter values.
 - If `--origin` is given without `--comsol`, the same `push_to_origin()` step
   runs on data read back from a `<model_name>_results/` folder's CSVs and
   `manifest.json` (via `load_dataset_csv()`/`load_datasets_from_folder()`),

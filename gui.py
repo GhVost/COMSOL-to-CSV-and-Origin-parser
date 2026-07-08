@@ -254,11 +254,21 @@ def make_data_table(df: pd.DataFrame) -> QTableWidget:
 
 # Display names for the groups shown in the item-picker, in the order shown.
 ITEM_GROUP_LABELS = {
+    'probe': 'Probe Tables',
     'table': 'Tables',
     '1d': '1D Plots',
     '2d': '2D Plots',
     '3d': '3D Plots',
 }
+
+
+def item_group(item: dict) -> str:
+    """Checklist group of a discovered item. Probe tables (a 'table' whose
+    COMSOL label says so) get their own group so a whole category can be
+    (de)selected at once; extraction-wise they stay ordinary tables."""
+    if item['kind'] == 'table':
+        return 'probe' if 'probe' in item['label'].lower() else 'table'
+    return item['kind'] if item['kind'] in ITEM_GROUP_LABELS else 'other'
 
 
 def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
@@ -295,7 +305,6 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
 
     win = QWidget()
     win.setWindowTitle("COMSOL Extractor")
-    win.setWindowFlags(win.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
     win.resize(1080, 620)
 
     # Left pane: status + item checklist. Right pane: MDI area whose tabs
@@ -442,43 +451,73 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
              'pending_preview': None,
              'worker_start': time.monotonic(), 'lmstat_raw': '',
              'license_info': '', 'status_text': '',
-             # Extraction-progress bookkeeping: current item start time,
-             # items finished, items total, current item label, predicted
-             # seconds remaining (-1 = unknown).
-             'extracting': False, 'ex_item_t0': 0.0,
-             'ex_done': 0, 'ex_total': 0, 'ex_label': '', 'ex_eta': -1.0}
+             # Extraction-progress bookkeeping: run/current-item start
+             # times, items finished, items total, current item label, and
+             # the work-weighted fractions from extract_selected (see
+             # progress_info() there).
+             'extracting': False, 'ex_run_t0': 0.0, 'ex_item_t0': 0.0,
+             'ex_done': 0, 'ex_total': 0, 'ex_label': '',
+             'ex_info': {'frac_done': 0.0, 'item_frac': 0.0, 'item_pred': -1.0}}
     result = {'items': None, 'push_to_origin': False, 'low_memory': False,
               'extraction': None}
 
+    # Checkable bold group heading -> its member entries; toggling the
+    # heading (de)selects the whole category at once.
+    group_members: dict[QListWidgetItem, list[QListWidgetItem]] = {}
+
     def populate_items(items):
-        # One checkable row per item, under bold headings by kind; a new
-        # heading is only inserted when the group changes.
+        # Grouped by category (probe tables / tables / 1D / 2D / 3D), one
+        # checkable row per item showing the human-readable COMSOL label.
         item_list.clear()
+        check_items.clear()
+        group_members.clear()
         bold = QFont()
         bold.setBold(True)
-        last_group = None
+        grouped: dict[str, list[dict]] = {}
         for item in items:
-            group = item['kind'] if item['kind'] in ITEM_GROUP_LABELS else 'other'
-            if group != last_group:
-                heading = QListWidgetItem(ITEM_GROUP_LABELS.get(group, 'Other'))
-                heading.setFont(bold)
-                heading.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                item_list.addItem(heading)
-                last_group = group
-            entry = QListWidgetItem(f"    {item['tag']}: {item['label']}")
-            entry.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
-                           | Qt.ItemFlag.ItemIsSelectable)
-            entry.setCheckState(Qt.CheckState.Checked)
-            item_list.addItem(entry)
-            check_items.append(entry)
+            grouped.setdefault(item_group(item), []).append(item)
+        for group in list(ITEM_GROUP_LABELS) + ['other']:
+            members = grouped.get(group)
+            if not members:
+                continue
+            heading = QListWidgetItem(ITEM_GROUP_LABELS.get(group, 'Other'))
+            heading.setFont(bold)
+            heading.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            heading.setCheckState(Qt.CheckState.Checked)
+            item_list.addItem(heading)
+            group_members[heading] = []
+            for item in members:
+                entry = QListWidgetItem(f"    {item['label']}")
+                entry.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+                               | Qt.ItemFlag.ItemIsSelectable)
+                entry.setCheckState(Qt.CheckState.Checked)
+                entry.setData(Qt.ItemDataRole.UserRole, item)
+                entry.setToolTip(f"{item['tag']}: {item['label']}")
+                item_list.addItem(entry)
+                check_items.append(entry)
+                group_members[heading].append(entry)
+
+    def on_list_item_changed(changed):
+        # A toggled group heading checks/unchecks its whole category.
+        # Member entries changing hit the dict lookup miss and fall through,
+        # so there is no recursion.
+        entries = group_members.get(changed)
+        if entries:
+            for entry in entries:
+                entry.setCheckState(changed.checkState())
+
+    item_list.itemChanged.connect(on_list_item_changed)
 
     def set_all(checked: bool):
+        cs = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for heading in group_members:
+            heading.setCheckState(cs)  # heading propagates to its members
         for entry in check_items:
-            entry.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            entry.setCheckState(cs)
 
     def on_extract():
         selected = [
-            item for item, entry in zip(state['items'], check_items)
+            entry.data(Qt.ItemDataRole.UserRole) for entry in check_items
             if entry.checkState() == Qt.CheckState.Checked
         ]
         result['push_to_origin'] = push_check.isChecked()
@@ -492,13 +531,15 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         # thread, showing per-item progress; the window closes itself once
         # extract_fn finishes (see on_extract_done).
         state['extracting'] = True
-        state['ex_item_t0'] = time.monotonic()
+        state['ex_run_t0'] = state['ex_item_t0'] = time.monotonic()
         state['ex_done'], state['ex_total'], state['ex_label'] = 0, len(selected), '...'
-        state['ex_eta'] = -1.0
+        state['ex_info'] = {'frac_done': 0.0, 'item_frac': 0.0, 'item_pred': -1.0}
         for w in (open_btn, select_all_btn, deselect_all_btn, extract_btn,
                   cancel_btn, item_list, push_check, low_memory_check):
             w.setEnabled(False)
-        progress_bar.setRange(0, len(selected))
+        # Weighted work fraction in permille, not an item count - the bar
+        # keeps moving through one long item.
+        progress_bar.setRange(0, 1000)
         progress_bar.setValue(0)
         progress_bar.setVisible(True)
         update_extract_status()
@@ -511,8 +552,8 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
                 out = extract_fn(
                     state['model'], state['model_path'], selected,
                     low_memory, collect,
-                    lambda done, total, label, eta:
-                        signals.extract_progress.emit(done, total, label, eta))
+                    lambda done, total, label, info:
+                        signals.extract_progress.emit(done, total, label, info))
                 signals.extract_done.emit((selected, out))
             except Exception as e:
                 traceback.print_exc()
@@ -552,7 +593,7 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         error = Signal(str)
         preview = Signal(object, object)   # item, (df, comments) or None
         license = Signal(str, str)         # info line, raw lmstat output
-        extract_progress = Signal(int, int, str, float)  # done, total, label, eta seconds (-1 unknown)
+        extract_progress = Signal(int, int, str, object)  # done, total, label, work-fraction info dict
         extract_done = Signal(object)      # (selected items, extract_fn result)
         extract_error = Signal(str)
 
@@ -652,20 +693,32 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
 
     def update_extract_status():
         done, total = state['ex_done'], state['ex_total']
-        cur = time.monotonic() - state['ex_item_t0']
+        info = state['ex_info']
+        now = time.monotonic()
+        elapsed = now - state['ex_run_t0']
+        # Work fraction completed: finished items' weight plus the current
+        # item's weight scaled by how far through its predicted time it is
+        # (capped below 1 so an overrunning item cannot claim to be done).
+        p = info['frac_done']
+        if info['item_pred'] > 0:
+            cur = now - state['ex_item_t0']
+            p += info['item_frac'] * min(cur / info['item_pred'], 0.95)
+        progress_bar.setValue(int(p * 1000))
         text = (f"Extracting {min(done + 1, total)}/{total}: {state['ex_label']}  "
-                f"(item {format_hms(cur)}")
-        if state['ex_eta'] >= 0:
-            # Size-aware estimate from extract_selected: per-item history of
-            # previous runs (rescaled by this run's speed) or this run's
-            # average, minus what the current item has already used.
-            text += f", ~{format_hms(state['ex_eta'] - cur)} remaining"
-        status_bar.setText(text + ")")
+                f"(elapsed {format_hms(elapsed)}, ")
+        if p > 0:
+            # Pace-based estimate: elapsed so far, extrapolated over the
+            # work fraction still left. Recomputed every tick, so it rises
+            # honestly when an item runs longer than its history predicted
+            # instead of counting down to zero and sticking there.
+            text += f"~{format_hms(elapsed * (1 - p) / p)} remaining)"
+        else:
+            text += "estimating remaining time...)"
+        status_bar.setText(text)
 
-    def on_extract_progress(done: int, total: int, label: str, eta: float):
-        state['ex_done'], state['ex_label'], state['ex_eta'] = done, label, eta
+    def on_extract_progress(done: int, total: int, label: str, info: dict):
+        state['ex_done'], state['ex_label'], state['ex_info'] = done, label, info
         state['ex_item_t0'] = time.monotonic()
-        progress_bar.setValue(done)
         update_extract_status()
 
     def on_extract_done(payload):
@@ -711,7 +764,7 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
     def request_preview(entry):
         if entry is None or entry not in check_items:
             return  # nothing selected, or a group heading
-        item = state['items'][check_items.index(entry)]
+        item = entry.data(Qt.ItemDataRole.UserRole)
         tag = item['tag']
         key = preview_key(item)
         if key in open_tabs:
@@ -762,7 +815,7 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
         except Exception:
             traceback.print_exc()  # plot failed; still show the Data tab
         tabs.addTab(make_data_table(df), 'Data')
-        add_mdi_tab(tabs, f"{item['tag']}: {item['label']}", preview_key(item))
+        add_mdi_tab(tabs, item['label'], preview_key(item))
         status_bar.setText(f"Preview ready: {item['tag']} "
                            f"({len(df)} rows x {len(df.columns)} cols)")
         pending = state.get('pending_preview')

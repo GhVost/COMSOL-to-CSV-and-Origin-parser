@@ -38,7 +38,7 @@ Code layout:
     gui.py             - PySide6 window, dialogs, and preview widgets
 """
 
-__version__ = '1.10.0'
+__version__ = '1.11.0'
 
 import argparse
 import os
@@ -81,15 +81,15 @@ def extract_selected(model, model_path: Path, selected: list, output_dir: Path,
                      progress=None) -> tuple[dict, list | None]:
     """Extract the selected items into output_dir (CSV files + manifest.json).
 
-    progress, if given, is called as progress(done, total, label, eta) when
+    progress, if given, is called as progress(done, total, label, info) when
     each item starts, and once more with done == total at the end - the GUI
-    uses it for its progress bar and remaining-time estimate. eta is the
-    predicted seconds for all remaining items (or -1 when unknown): each
+    uses it for its progress bar and remaining-time estimate. info carries
+    work-weighted progress fractions (see progress_info() below): each
     item's duration is recorded in <output_dir>/.extract_timing.json, so a
-    re-run of the same model predicts per-item times from that history
-    (implicitly weighting items by their data size), rescaled live by the
-    ratio of this run's actual vs predicted durations; items never seen
-    before fall back to this run's average.
+    re-run of the same model weights each item by how long it actually took
+    last time (implicitly, by its data size); the GUI then estimates the
+    remaining time from this run's measured pace over the work fraction
+    completed, which stays honest even when one item overruns its history.
 
     Returns (manifest, datasets): the manifest dict (also written to
     manifest.json) and, when collect_datasets is True, the list of
@@ -118,6 +118,18 @@ def extract_selected(model, model_path: Path, selected: list, output_dir: Path,
     # memory on a large model with many selected items.
     datasets = [] if collect_datasets else None
 
+    # Dataset/file names come from the human-readable COMSOL label ("Probe
+    # Table 1", "S-parameter"), not the internal tag ("tbl1", "pg66"); the
+    # tag is appended only to break a duplicate-label collision.
+    used_names: set[str] = set()
+
+    def dataset_name(label: str, tag: str) -> str:
+        name = sanitize_filename(label) or tag
+        if name.lower() in used_names:
+            name = sanitize_filename(f"{label} ({tag})")
+        used_names.add(name.lower())
+        return name
+
     # Per-item duration history from previous runs of this model ('tag' ->
     # {'seconds': float, 'rows': int}) - a re-run predicts each remaining
     # item's time from how long that same item (at its recorded size) took
@@ -133,32 +145,46 @@ def extract_selected(model, model_path: Path, selected: list, output_dir: Path,
         history = {}
     durations: dict[str, float] = {}  # this run's actual seconds per tag
 
-    def eta_seconds(next_index: int) -> float:
-        """Predicted seconds for items[next_index:]: per-item history where
-        available - rescaled by this run's observed actual/predicted ratio -
-        and this run's average for never-seen items; -1 if unknowable yet."""
-        pred_done = sum(history[s['tag']]['seconds'] for s in selected[:next_index]
-                        if s['tag'] in history and s['tag'] in durations)
-        act_done = sum(durations[s['tag']] for s in selected[:next_index]
-                       if s['tag'] in history and s['tag'] in durations)
-        scale = act_done / pred_done if pred_done > 0 else 1.0
-        avg = sum(durations.values()) / len(durations) if durations else None
-        eta = 0.0
-        for s in selected[next_index:]:
-            if s['tag'] in history:
-                eta += history[s['tag']]['seconds'] * scale
-            elif avg is not None:
-                eta += avg
-            else:
-                return -1.0  # first run, nothing measured yet
-        return eta
+    def progress_info(next_index: int) -> dict:
+        """Work-weighted progress for the GUI's remaining-time estimate.
+
+        Each item's weight is its duration from a previous run (never-seen
+        items get the average of the known weights, or 1 on a first run, so
+        only the relative sizes matter). Returns
+          frac_done - weight fraction of the items already finished,
+          item_frac - weight fraction of the item about to start,
+          item_pred - that item's expected wall seconds at this run's
+                      measured pace (-1 when there is no basis yet).
+        The GUI turns these into remaining = elapsed * (1 - p) / p.
+        """
+        weights = [history[s['tag']]['seconds'] if s['tag'] in history else None
+                   for s in selected]
+        known = [w for w in weights if w is not None]
+        default = sum(known) / len(known) if known else 1.0
+        weights = [w if w is not None else default for w in weights]
+        total_w = sum(weights)
+        if next_index >= len(selected) or total_w <= 0:
+            return {'frac_done': 1.0, 'item_frac': 0.0, 'item_pred': 0.0}
+        done_w = sum(weights[:next_index])
+        act = sum(durations.get(s['tag'], 0.0) for s in selected[:next_index])
+        if act > 0 and done_w > 0:
+            scale = act / done_w  # this run's seconds per weight unit
+        elif selected[next_index]['tag'] in history:
+            scale = 1.0  # no pace measured yet; trust history as-is
+        else:
+            scale = -1.0  # first run, first item: no basis for a prediction
+        return {'frac_done': done_w / total_w,
+                'item_frac': weights[next_index] / total_w,
+                'item_pred': weights[next_index] * scale if scale > 0 else -1.0}
 
     total = len(selected)
     for done, item in enumerate(selected):
         tag, label, kind = item['tag'], item['label'], item['kind']
         if progress is not None:
-            progress(done, total, f"{tag} ({label})", eta_seconds(done))
-        item_t0 = time.monotonic()
+            progress(done, total, f"{tag} ({label})", progress_info(done))
+        # perf_counter, not monotonic: the latter ticks in 15.6 ms steps on
+        # Windows, recording sub-tick items as 0-second history entries.
+        item_t0 = time.perf_counter()
 
         if kind == 'table':
             print(f"  - {tag} ({label})")
@@ -166,7 +192,7 @@ def extract_selected(model, model_path: Path, selected: list, output_dir: Path,
             if result is not None and not result[0].empty:
                 df, comments = result
                 comments = comments + [date_stamp]
-                name = sanitize_filename(f"table_{tag}_{label}")
+                name = dataset_name(label, tag)
                 fname = name + '.csv'
                 write_csv_with_comments(df, output_dir / fname, comments)
                 manifest['tables'].append({'tag': tag, 'label': label, 'file': fname,
@@ -175,14 +201,14 @@ def extract_selected(model, model_path: Path, selected: list, output_dir: Path,
                 if datasets is not None:
                     datasets.append({'name': name, 'kind': 'table', 'df': df, 'comments': comments})
                 print(f"    -> Saved {fname}  ({len(df)} rows x {len(df.columns)} cols)")
-            durations[tag] = time.monotonic() - item_t0
+            durations[tag] = time.perf_counter() - item_t0
             history[tag] = {'seconds': durations[tag],
                             'rows': len(result[0]) if result is not None else 0}
             continue
 
         # Everything else (1D/2D/3D plot groups, or anything else
         # get_plot_type() couldn't classify) goes through COMSOL's "Plot"
-        # export and is written as 'plot<kind>_<tag>_<label>.csv'.
+        # export and is written as '<label>.csv'.
         pg, class_name, ptype = item['pg'], item['class_name'], kind
         print(f"\n  [{ptype.upper():>7}] {tag} ({label})  [{class_name}]")
 
@@ -198,7 +224,7 @@ def extract_selected(model, model_path: Path, selected: list, output_dir: Path,
                 pass
             comments = comments + [date_stamp]
 
-            name = sanitize_filename(f"plot{ptype}_{tag}_{label}")
+            name = dataset_name(label, tag)
             fname = name + '.csv'
             write_csv_with_comments(df, output_dir / fname, comments)
             entry = {'tag': tag, 'label': label, 'file': fname,
@@ -222,12 +248,12 @@ def extract_selected(model, model_path: Path, selected: list, output_dir: Path,
                 manifest['other'].append(entry)
             print(f"    [!] No data extracted for '{tag}'")
 
-        durations[tag] = time.monotonic() - item_t0
+        durations[tag] = time.perf_counter() - item_t0
         history[tag] = {'seconds': durations[tag],
                         'rows': len(result[0]) if result is not None else 0}
 
     if progress is not None:
-        progress(total, total, 'writing manifest...', 0.0)
+        progress(total, total, 'writing manifest...', progress_info(total))
 
     # Save the measured per-item durations for the next run's estimates.
     try:

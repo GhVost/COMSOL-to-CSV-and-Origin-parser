@@ -1,5 +1,45 @@
 # Changelog
 
+## v1.11.0 — 2026-07-08
+
+Category selection, human-readable naming, complete sweep-parameter legends,
+and an honest remaining-time estimate.
+
+### Fixed
+- **Remaining-time estimate no longer sticks at 0:00:00.** v1.10.0 predicted
+  each item's time once at its start and counted down, so any item running
+  past its prediction pinned the display to zero for the rest of that item.
+  The estimate is now pace-based (elapsed time extrapolated over the
+  work-weighted fraction completed, recomputed every half-second): it can
+  never show zero while items remain and rises honestly when an item
+  overruns its history.
+- **Origin long names lost all but the innermost sweep parameter.** For
+  nested sweeps COMSOL headers like `R (Ω), gap=2 µm, ring=1.3 µm` were
+  reduced to `ring=1.3 µm`, making same-valued inner-sweep columns
+  indistinguishable. The long name now keeps the full parameter list, and
+  the complete original header (measured quantity included) is preserved in
+  each column's Comments row.
+- Item durations are measured with `perf_counter` - `monotonic` ticks in
+  15.6 ms steps on Windows and recorded fast items as 0-second history.
+
+### Changed
+- The status line during extraction shows the total elapsed time instead of
+  the confusing per-item timer, and the progress bar advances by each
+  item's expected share of the work (so it keeps moving through one long
+  item) rather than by item count.
+- **Human-readable names everywhere:** the checklist, preview tabs, CSV
+  filenames, and Origin books use the COMSOL label ("Probe Table 1"), not
+  internal tags like `pg66`/`tbl1`. The tag is appended only to break a
+  duplicate-label collision, remains in `manifest.json`, and shows in the
+  item's tooltip.
+- The window is no longer always-on-top.
+
+### Added
+- **Category selection** - the checklist group headings (Probe Tables /
+  Tables / 1D / 2D / 3D Plots) are themselves checkboxes that select or
+  deselect the whole category at once. Probe tables are split out of
+  Tables by their COMSOL label (extraction-wise they stay ordinary tables).
+
 ## v1.10.0 — 2026-07-08
 
 In-window extraction progress with size-aware time estimates.

@@ -29,6 +29,9 @@ def test_split_label_unit_handles_middle_unit_with_curve_label():
 def test_legend_label_from_column_uses_comsol_curve_suffix():
     assert legend_label_from_column("Iout (mA), V_dc=1 V") == "V_dc=1 V"
     assert legend_label_from_column("Iout 1 (mA)") == "Iout 1"
+    # Nested sweeps keep every parameter, not just the innermost one.
+    assert (legend_label_from_column("R (ohm), gap=2 um, ring=1.3 um")
+            == "gap=2 um, ring=1.3 um")
 
 
 def test_sanitize_filename_removes_windows_forbidden_chars():
