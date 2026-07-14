@@ -32,6 +32,10 @@ def test_legend_label_from_column_uses_comsol_curve_suffix():
     # Nested sweeps keep every parameter, not just the innermost one.
     assert (legend_label_from_column("R (ohm), gap=2 um, ring=1.3 um")
             == "gap=2 um, ring=1.3 um")
+    # Legend-derived series names are parameter parts only - none may be
+    # dropped as a presumed quantity name.
+    assert (legend_label_from_column("internal_ring=1 um, external_ring=1.1 um, f0=3.32 GHz (S)")
+            == "internal_ring=1 um, external_ring=1.1 um, f0=3.32 GHz")
 
 
 def test_sanitize_filename_removes_windows_forbidden_chars():
@@ -127,6 +131,25 @@ def test_line_series_dataframe_splits_concatenated_sweeps():
     assert list(wide.columns) == ["freq (GHz)", "Iout 1 (mA)", "Iout 2 (mA)"]
     assert wide["Iout 1 (mA)"].tolist() == [1.0, 2.0, 3.0]
     assert wide["Iout 2 (mA)"].tolist() == [10.0, 20.0, 30.0]
+
+
+def test_line_series_dataframe_splits_disjoint_sweep_windows_by_legend_count():
+    # Each parameter combination sweeps its own narrow band around its
+    # resonance; the next window can start above the previous one's end, so
+    # there is no x reversal at the boundary. COMSOL's legend count says how
+    # many curves there really are - the largest forward jumps fill in the
+    # missing boundaries.
+    df = pd.DataFrame({
+        "freq (Hz)": [1.0, 2.0, 3.0, 10.0, 11.0, 12.0, 20.0, 21.0, 22.0],
+        "motional conductance (S)": [1.0, 5.0, 1.0, 2.0, 6.0, 2.0, 3.0, 7.0, 3.0],
+    })
+    df.attrs['legend_labels'] = ["ring=1 um", "ring=1.1 um", "ring=1.2 um"]
+
+    wide = line_series_dataframe(df)
+
+    assert list(wide.columns) == ["freq (Hz)", "ring=1 um (S)",
+                                  "ring=1.1 um (S)", "ring=1.2 um (S)"]
+    assert wide["ring=1.1 um (S)"].dropna().tolist() == [2.0, 6.0, 2.0]
 
 
 def test_line_series_dataframe_keeps_scattered_x_as_one_series():

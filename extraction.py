@@ -63,7 +63,15 @@ def legend_label_from_column(label: str) -> str:
     """
     name, _unit = split_label_unit(label)
     parts = [part.strip() for part in name.split(',') if part.strip()]
-    return ', '.join(parts[1:]) if len(parts) > 1 else name
+    # The legend is the sweep-parameter list ('gap=2 um, ring=1.3 um'); the
+    # measured quantity itself is dropped - it's the same for every curve
+    # and already lives in the axis title / column comments. Legend-derived
+    # series names consist of parameter parts only, so filter by '=' rather
+    # than assuming the first part is the quantity.
+    params = [part for part in parts if '=' in part]
+    if params:
+        return ', '.join(params)
+    return parts[-1] if len(parts) > 1 else name
 
 
 def legend_labels_comment(labels: list[str]) -> str:
@@ -166,7 +174,7 @@ def is_monotonic_series(values: pd.Series) -> bool:
     return bool((diffs >= 0).all() or (diffs <= 0).all())
 
 
-def split_line_segments(df: pd.DataFrame) -> list[pd.DataFrame]:
+def split_line_segments(df: pd.DataFrame, expected: int | None = None) -> list[pd.DataFrame]:
     """Split a two-column line export into repeated x-sweeps.
 
     COMSOL sometimes exports parametric line plots as one long x/y pair:
@@ -174,9 +182,16 @@ def split_line_segments(df: pd.DataFrame) -> list[pd.DataFrame]:
     connects the last point of one sweep to the first point of the next,
     creating the visible zigzag. Break the data where the x direction
     reverses or jumps back to the start of the next sweep.
+
+    expected is the curve count COMSOL's own legend announces, when known.
+    Sweeps covering disjoint x windows (e.g. one narrow band around each
+    parameter combination's resonance) leave no reversal at their boundary
+    when the next window starts above the previous one's end - the largest
+    forward x jumps are added as boundaries until the expected count is
+    reached.
     """
     num = df.select_dtypes('number')
-    if num.shape[1] != 2 or len(num) < 4:
+    if num.shape[1] != 2 or len(num) < 4 or expected == 1:
         return [df]
 
     x = num.iloc[:, 0].reset_index(drop=True)
@@ -186,16 +201,20 @@ def split_line_segments(df: pd.DataFrame) -> list[pd.DataFrame]:
         return [df]
 
     direction = 1 if (nonzero > 0).sum() >= (nonzero < 0).sum() else -1
-    breaks = [0]
-    for idx, diff in diffs.items():
-        if idx == 0 or pd.isna(diff) or diff == 0:
-            continue
-        if diff * direction < 0:
-            breaks.append(idx)
-    breaks.append(len(df))
+    starts = {int(idx) for idx, diff in diffs.items()
+              if idx != 0 and not pd.isna(diff) and diff != 0 and diff * direction < 0}
 
+    if expected is not None and len(starts) < expected - 1:
+        forward = diffs.iloc[1:]
+        forward = forward[(forward * direction > 0) & ~forward.index.isin(starts)]
+        extra = forward.abs().nlargest(expected - 1 - len(starts))
+        starts |= {int(idx) for idx in extra.index}
+
+    breaks = [0] + sorted(starts) + [len(df)]
     segments = [df.iloc[start:end].reset_index(drop=True)
                 for start, end in zip(breaks, breaks[1:]) if end > start]
+    if expected is not None and len(segments) == expected:
+        return segments  # matches COMSOL's own curve count - trust it
     # A genuine concatenated sweep splits into a few long monotonic runs.
     # Scattered x values (e.g. a per-parameter extrema table, one resonance
     # frequency per parameter combination) reverse direction constantly and
@@ -223,13 +242,13 @@ def line_series_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if num.shape[1] != 2:
         return df
 
-    segments = split_line_segments(num)
+    labels = df.attrs.get('legend_labels') or []
+    segments = split_line_segments(num, expected=len(labels) or None)
     if len(segments) <= 1:
         return df
 
     x_col, y_col = num.columns[:2]
     y_name, y_unit = split_label_unit(y_col)
-    labels = df.attrs.get('legend_labels') or []
     wide = None
     for index, segment in enumerate(segments, start=1):
         part = segment[[x_col, y_col]].copy()
@@ -942,8 +961,8 @@ def extract_via_export(model, pg, pg_tag: str, output_dir: Path,
         if result is None:
             return None
         df, comments = result
-        segments = split_line_segments(df)
         labels = get_plot_legend_labels(pg)
+        segments = split_line_segments(df, expected=len(labels) or None)
         if len(labels) == len(segments):
             set_legend_labels(df, labels)
 
