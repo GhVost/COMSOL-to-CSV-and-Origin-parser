@@ -159,12 +159,20 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = '') -> Path
             # the per-curve long names hold only the sweep parameters.
             y_title = ''
             if kind in ('table', '1d'):
-                wide = line_series_dataframe(df)
-                if len(wide.columns) > len(df.columns) and len(df.columns) == 2:
-                    quantity, unit = split_label_unit(df.columns[1])
-                    quantity = quantity.split(',')[0].strip()
-                    y_title = f"{quantity} ({unit})" if unit else quantity
-                df = wide
+                # Derive the y-axis title from the original COMSOL headers
+                # (which always lead with the measured quantity) before the
+                # split renames series to their parameter lists - works for
+                # stitched 2-column exports and already-wide ones alike, and
+                # stays empty for mixed-quantity tables.
+                quantities = {split_label_unit(c)[0].split(',')[0].strip()
+                              for c in df.columns[1:]}
+                units = {split_label_unit(c)[1] for c in df.columns[1:]}
+                if len(quantities) == 1:
+                    quantity = quantities.pop()
+                    if quantity and '=' not in quantity:
+                        unit = units.pop() if len(units) == 1 else ''
+                        y_title = f"{quantity} ({unit})" if unit else quantity
+                df = line_series_dataframe(df)
 
             wb = op.new_book('w', name)
             sheet = wb[0]
