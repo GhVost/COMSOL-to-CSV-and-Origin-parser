@@ -45,6 +45,7 @@ import os
 import sys
 import json
 import time
+import traceback
 from pathlib import Path
 from datetime import datetime
 
@@ -69,11 +70,15 @@ def confirm_or_exit(message: str):
 
 
 def pause_if_frozen():
-    """When running as a bundled .exe (no console window of its own), wait
-    for Enter before the window closes so any final messages - including
-    OriginLab push errors - stay visible."""
+    """When running as a bundled .exe, wait for Enter before the console
+    window closes so an error message stays readable. Used on failure paths
+    only - a successful run exits (and thereby shuts down the in-process
+    COMSOL engine, releasing its license seat) without needing a keypress."""
     if getattr(sys, 'frozen', False):
-        input("\nPress Enter to exit... ")
+        try:
+            input("\nPress Enter to exit... ")
+        except EOFError:
+            pass
 
 
 def extract_selected(model, model_path: Path, selected: list, output_dir: Path,
@@ -341,8 +346,7 @@ def main():
             os.startfile(origin_project)  # open the project in a fresh Origin instance
 
         os.startfile(folder)  # open the results folder in File Explorer
-        print("Done.")
-        pause_if_frozen()
+        print("Done - closing.")
         return
 
     # -- Model path: a CLI arg loads immediately; otherwise the window's
@@ -416,9 +420,24 @@ def main():
     # -- Open the output folder and clean up --
     os.startfile(output_dir)  # open the results folder in File Explorer
     client.clear()
-    print("Done.")
-    pause_if_frozen()
+    # Exiting also shuts down the in-process COMSOL engine (MPh's exit hook
+    # stops the JVM), releasing the license seat - no keypress needed.
+    print("Done - closing.")
 
 
 if __name__ == '__main__':
-    main()
+    # Frozen-exe safety net: a successful run exits on its own (taking the
+    # in-process COMSOL engine with it), while any error stays readable in
+    # the console until Enter is pressed - and still exits cleanly after.
+    try:
+        main()
+    except SystemExit as exc:
+        if exc.code not in (None, 0):
+            pause_if_frozen()
+        raise
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        traceback.print_exc()
+        pause_if_frozen()
+        sys.exit(1)
