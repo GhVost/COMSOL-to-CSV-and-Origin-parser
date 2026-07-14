@@ -154,15 +154,25 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = '') -> Path
             # Parametric line sweeps can arrive as one stitched x/y curve.
             # Convert them to wide series before writing to Origin so the
             # graph gets independent curves, a real legend, and no connector
-            # line between parameter values.
+            # line between parameter values. The measured quantity from the
+            # original 2-column header becomes the graph's y-axis title -
+            # the per-curve long names hold only the sweep parameters.
+            y_title = ''
             if kind in ('table', '1d'):
-                df = line_series_dataframe(df)
+                wide = line_series_dataframe(df)
+                if len(wide.columns) > len(df.columns) and len(df.columns) == 2:
+                    quantity, unit = split_label_unit(df.columns[1])
+                    quantity = quantity.split(',')[0].strip()
+                    y_title = f"{quantity} ({unit})" if unit else quantity
+                df = wide
 
             wb = op.new_book('w', name)
             sheet = wb[0]
             sheet.from_df(df)
             if len(df.columns) >= 2:
-                sheet.cols_axis('xy', repeat=True)
+                # One x column, every other column a y series - not the
+                # alternating X,Y,X,Y pattern 'xy'+repeat would produce.
+                sheet.cols_axis('x' + 'y' * (len(df.columns) - 1), repeat=False)
 
             # Carry column names/units (from 'Name (unit)' headers) over to
             # Origin's long name / units label rows. Curve columns get the
@@ -192,11 +202,22 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = '') -> Path
                 layer = graph[0]
                 for i in range(1, len(df.columns)):
                     layer.add_plot(sheet, coly=i, colx=0, type='l')
+                # Group and legend separately - a failed group() must not
+                # skip the legend rebuild, or Origin keeps its default
+                # single-entry legend.
                 try:
                     layer.group(True)
+                except Exception:
+                    pass
+                try:
                     layer.LT_execute('legend -r')
                 except Exception:
                     pass
+                if y_title:
+                    try:
+                        layer.LT_execute(f'yl.text$ = "{y_title}"')
+                    except Exception:
+                        pass
                 layer.rescale()
                 graph.lname = name
 
