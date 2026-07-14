@@ -196,6 +196,14 @@ def split_line_segments(df: pd.DataFrame) -> list[pd.DataFrame]:
 
     segments = [df.iloc[start:end].reset_index(drop=True)
                 for start, end in zip(breaks, breaks[1:]) if end > start]
+    # A genuine concatenated sweep splits into a few long monotonic runs.
+    # Scattered x values (e.g. a per-parameter extrema table, one resonance
+    # frequency per parameter combination) reverse direction constantly and
+    # would shatter into many 1-2 point "sweeps" - keep those as one series.
+    # ponytail: average run length >= 3 as the sweep/scatter cutoff; make it
+    # smarter (e.g. repeated identical x-starts) if a real sweep ever trips it.
+    if segments and len(df) / len(segments) < 3:
+        return [df]
     return segments or [df]
 
 

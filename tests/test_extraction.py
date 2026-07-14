@@ -129,6 +129,21 @@ def test_line_series_dataframe_splits_concatenated_sweeps():
     assert wide["Iout 2 (mA)"].tolist() == [10.0, 20.0, 30.0]
 
 
+def test_line_series_dataframe_keeps_scattered_x_as_one_series():
+    # Extrema-style tables (one resonance per parameter combination) have
+    # non-monotonic x throughout; they must not shatter into 2-point sweeps.
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({
+        "freq (Hz)": rng.permutation(np.linspace(3.31e9, 3.35e9, 24)),
+        "motional conductance (S)": rng.uniform(0.003, 0.005, 24),
+    })
+
+    wide = line_series_dataframe(df)
+
+    assert list(wide.columns) == ["freq (Hz)", "motional conductance (S)"]
+    assert len(wide) == 24
+
+
 def test_line_markers_returns_peak_per_series():
     df = pd.DataFrame({"x": [1, 2, 3], "a": [1, 3, 2], "b": [5, 4, 6]})
 
