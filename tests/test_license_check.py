@@ -1,10 +1,23 @@
 from license_check import (
     load_mask_hosts_setting,
+    load_setting,
     mask_hostname,
     save_mask_hosts_setting,
+    save_setting,
     summarize_lmstat,
 )
 import license_check
+
+
+def test_save_setting_keeps_other_keys(tmp_path, monkeypatch):
+    monkeypatch.setattr(license_check, 'SETTINGS_PATH', tmp_path / 'settings.json')
+
+    save_mask_hosts_setting(True)
+    save_setting('last_model_dir', r'C:\models')
+
+    assert load_mask_hosts_setting() is True
+    assert load_setting('last_model_dir') == r'C:\models'
+    assert load_setting('missing', 'fallback') == 'fallback'
 
 
 def test_summarize_lmstat_filters_hosts_and_strips_pid_tail():

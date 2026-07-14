@@ -35,8 +35,8 @@ from extraction import (
     line_series_dataframe, subsample_for_plot, surface_columns,
 )
 from license_check import (
-    load_mask_hosts_setting, query_license_usage, save_mask_hosts_setting,
-    summarize_lmstat,
+    load_mask_hosts_setting, load_setting, query_license_usage,
+    save_mask_hosts_setting, save_setting, summarize_lmstat,
 )
 from origin_push import origin_already_running, start_originpro
 
@@ -47,13 +47,20 @@ def qt_app() -> QApplication:
 
 
 def pick_file_dialog() -> Path | None:
-    """Open a native file-picker dialog and return the selected .mph path."""
+    """Open a native file-picker dialog and return the selected .mph path.
+    Starts in (and remembers) the folder the last model was opened from."""
     qt_app()
+    last_dir = load_setting('last_model_dir', '')
     file_path, _ = QFileDialog.getOpenFileName(
         None, 'Select a COMSOL model file',
+        dir=last_dir if last_dir and Path(last_dir).is_dir() else '',
         filter='COMSOL models (*.mph);;All files (*.*)',
     )
-    return Path(file_path) if file_path else None
+    if not file_path:
+        return None
+    path = Path(file_path)
+    save_setting('last_model_dir', str(path.parent))
+    return path
 
 
 def pick_folder_dialog(title: str) -> Path | None:

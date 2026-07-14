@@ -11,27 +11,45 @@ import json
 import subprocess
 from pathlib import Path
 
-# Small persisted settings file (just the "mask hostnames" checkbox state)
-# so the license report starts in the same mode it was left in.
+# Small persisted settings file (the "mask hostnames" checkbox state, the
+# last folder a model was opened from, ...) so the app starts the way it
+# was left. All access is best-effort - a failed read/write just falls back
+# to defaults on the next run.
 SETTINGS_PATH = Path(os.environ.get('APPDATA', str(Path.home()))) / 'COMSOLExtractor' / 'settings.json'
+
+
+def load_setting(key: str, default=None):
+    """Return one persisted setting (default if missing/unreadable)."""
+    try:
+        return json.loads(SETTINGS_PATH.read_text(encoding='utf-8')).get(key, default)
+    except Exception:
+        return default
+
+
+def save_setting(key: str, value):
+    """Persist one setting, keeping every other stored key intact."""
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding='utf-8'))
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    data[key] = value
+    try:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATH.write_text(json.dumps(data), encoding='utf-8')
+    except Exception:
+        pass
 
 
 def load_mask_hosts_setting() -> bool:
     """Return the last saved 'mask hostnames' preference (default False)."""
-    try:
-        data = json.loads(SETTINGS_PATH.read_text(encoding='utf-8'))
-        return bool(data.get('mask_hosts', False))
-    except Exception:
-        return False
+    return bool(load_setting('mask_hosts', False))
 
 
 def save_mask_hosts_setting(value: bool):
     """Persist the 'mask hostnames' preference for the next start."""
-    try:
-        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SETTINGS_PATH.write_text(json.dumps({'mask_hosts': bool(value)}), encoding='utf-8')
-    except Exception:
-        pass  # best-effort; a failed save just falls back to the default next run
+    save_setting('mask_hosts', bool(value))
 
 
 def mask_hostname(host: str) -> str:
