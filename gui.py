@@ -906,10 +906,10 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
             box_layout = QVBoxLayout(box)
             filter_row = QHBoxLayout()
             filter_row.addWidget(QLabel("Host filter:"))
-            box.filter_edit = QLineEdit('*-*')
+            box.filter_edit = QLineEdit(str(load_setting('host_filter', '*-*')))
             box.filter_edit.setToolTip(
                 "fnmatch pattern applied to session hostnames, e.g. '*-*' or "
-                "'impt-*'; '*' shows all hosts")
+                "'impt-*'; '*' shows all hosts. Remembered for next start.")
             filter_row.addWidget(box.filter_edit)
             box.mask_check = QCheckBox("Mask hostnames")
             box.mask_check.setToolTip(
@@ -921,7 +921,9 @@ def run_extraction_window(model_path: Path | None, comsol_warning: str | None,
             box.text_view = QPlainTextEdit()
             box.text_view.setReadOnly(True)
             box_layout.addWidget(box.text_view)
-            box.filter_edit.textChanged.connect(lambda _: render_license())
+            # Saved on every keystroke, so the filter survives a crash too.
+            box.filter_edit.textChanged.connect(
+                lambda text: (save_setting('host_filter', text), render_license()))
             box.mask_check.toggled.connect(on_mask_toggled)
             add_mdi_tab(box, "License usage", key)
         render_license()
