@@ -19,7 +19,7 @@ except ImportError:
 
 from extraction import (
     legend_label_from_column, line_series_dataframe, load_dataset_csv,
-    split_label_unit,
+    sanitize_filename, split_label_unit,
 )
 
 
@@ -125,12 +125,17 @@ def load_datasets_from_folder(folder: Path, low_memory: bool = False) -> list[di
     return datasets
 
 
-def push_to_origin(datasets: list, output_dir: Path, template: str = '') -> Path | None:
+def push_to_origin(datasets: list, output_dir: Path, template: str = '',
+                   project_name: str = 'comsol_results') -> Path | None:
     """
     Build an OriginLab project directly from extracted DataFrames.
     Requires: pip install originpro
     Must be run with Origin installed (originpro drives it via COM).
+
+    project_name (the .mph model's filename stem, when known) names the
+    saved .opju file.
     """
+    opju_name = sanitize_filename(project_name or 'comsol_results') + '.opju'
     try:
         import originpro as op
     except ImportError:
@@ -238,7 +243,7 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = '') -> Path
             print(f"  -> Imported: {name}")
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        opju_path = (output_dir / 'comsol_results.opju').resolve()
+        opju_path = (output_dir / opju_name).resolve()
         origin_save_path = opju_path
 
         # Origin's COM save API still fails at the legacy Windows MAX_PATH
@@ -248,7 +253,7 @@ def push_to_origin(datasets: list, output_dir: Path, template: str = '') -> Path
         # filesystem API.
         if len(str(opju_path)) >= 248:
             staging_dir = Path(tempfile.mkdtemp(prefix='comsol_origin_'))
-            origin_save_path = staging_dir / 'comsol_results.opju'
+            origin_save_path = staging_dir / opju_name
 
         # Origin's external-Python API returns False when saving fails; it
         # does not necessarily raise an exception.  @SDO allows Origin 2022+

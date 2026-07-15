@@ -338,9 +338,20 @@ def main():
         if not datasets:
             sys.exit("No datasets found to import.")
 
+        # Name the .opju after the .mph model recorded in manifest.json,
+        # falling back to the results folder's name.
+        try:
+            with open(folder / 'manifest.json', encoding='utf-8') as f:
+                project_name = Path(json.load(f).get('model', '')).stem
+        except Exception:
+            project_name = ''
+        if not project_name:
+            project_name = folder.name.removesuffix('_results')
+
         print("\nPushing results to OriginLab...")
         origin_pids_before = get_origin_pids()
-        origin_project = push_to_origin(datasets, folder, template=args.origin_template)
+        origin_project = push_to_origin(datasets, folder, template=args.origin_template,
+                                        project_name=project_name)
         if origin_project is not None:
             close_new_origin_processes(origin_pids_before)
             os.startfile(origin_project)  # open the project in a fresh Origin instance
@@ -412,7 +423,8 @@ def main():
     if do_origin:
         print("\nPushing results to OriginLab...")
         origin_pids_before = get_origin_pids()
-        origin_project = push_to_origin(datasets, output_dir, template=args.origin_template)
+        origin_project = push_to_origin(datasets, output_dir, template=args.origin_template,
+                                        project_name=choice['model_path'].stem)
         if origin_project is not None:
             close_new_origin_processes(origin_pids_before)
             os.startfile(origin_project)  # open the project in a fresh Origin instance

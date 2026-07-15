@@ -79,7 +79,7 @@ then click **Extract**. The window contains:
   the app starts.
 
 Click **Extract** to write the selected items to `<model_name>_results/`
-and, if the OriginLab checkbox is ticked, build `comsol_results.opju` in the
+and, if the OriginLab checkbox is ticked, build `<model_name>.opju` in the
 same folder. The window stays open while the extraction runs, showing a
 progress bar (weighted by each item's expected share of the work, so it
 keeps moving through one long item) and a status line with the current
@@ -181,12 +181,13 @@ With `--comsol`, results are written to `<model_name>_results/` next to the
   row/column counts, and the same comments)
 - `.extract_timing.json` — per-item durations/row counts from the last run,
   used to weight the next run's progress bar and remaining-time estimate
-- `comsol_results.opju` (only with `--origin`) — an OriginLab project with
-  one worksheet per dataset; tables and 1D plots additionally get a line
-  graph
+- `<model_name>.opju` (only with `--origin`) — an OriginLab project named
+  after the .mph model, with one worksheet per dataset; tables and 1D plots
+  additionally get a line graph
 
-With `--origin` alone, `comsol_results.opju` is written into the
-previously extracted folder you picked, built from its CSVs/`manifest.json`.
+With `--origin` alone, the `.opju` (named after the model recorded in
+`manifest.json`) is written into the previously extracted folder you
+picked, built from its CSVs/`manifest.json`.
 
 ## Code layout
 
